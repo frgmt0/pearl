@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+chess_terminal/saved_games/
+chess_terminal/notes.txt
+logs/
+saved_models/
+chess_terminal/temp_data/
