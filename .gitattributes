@@ -1,2 +1,7 @@
+saved_models/base.pt filter=lfs diff=lfs merge=lfs -text
+saved_models/default_weights.pt filter=lfs diff=lfs merge=lfs -text
+saved_models/pearl.pt filter=lfs diff=lfs merge=lfs -text
+saved_models/pearlXL.pt filter=lfs diff=lfs merge=lfs -text
+saved_models/standard.pt filter=lfs diff=lfs merge=lfs -text
  filter=lfs diff=lfs merge=lfs -text
 saved_models/* filter=lfs diff=lfs merge=lfs -text
