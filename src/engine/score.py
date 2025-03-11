@@ -10,6 +10,7 @@ import chess
 import torch
 import os
 import numpy as np
+import glob
 
 # Import from our neural network implementation
 from src.engine.nnue.network import NNUE, board_to_features, get_feature_diff
@@ -107,12 +108,18 @@ piece_values = {
 
 def create_model():
     """
-    Create a new NNUE model.
+    Create a new NNUE model with the 16M parameter architecture.
     
     Returns:
         New NNUE model
     """
-    return NNUE()
+    # Create model with the 16M parameter architecture (20 residual blocks)
+    model = NNUE(num_blocks=20)
+    
+    # Initialize weights
+    model.initialize_weights()
+    
+    return model
 
 def save_model(model, filename="default_weights.pt"):
     """
@@ -131,7 +138,7 @@ def save_model(model, filename="default_weights.pt"):
     # Full path to save
     path = os.path.join("saved_models", filename)
     
-    # Save the model
+    # Save the model state dict only, not the entire model
     torch.save(model.state_dict(), path)
     print(f"Model weights saved to {path}")
     
@@ -153,13 +160,23 @@ def load_model(model_path="saved_models/default_weights.pt"):
     # Check if model weights exist
     if os.path.exists(model_path):
         try:
-            # Load weights
-            model.load_state_dict(torch.load(model_path))
-            print(f"Loaded model from {model_path}")
+            # Try different loading approaches to handle PyTorch version differences
+            try:
+                # First try with weights_only=False
+                model.load_state_dict(torch.load(model_path, weights_only=False))
+                print(f"Loaded model from {model_path}")
+            except:
+                # If that fails, try with map_location
+                model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+                print(f"Loaded model from {model_path} using map_location")
         except Exception as e:
             print(f"Error loading weights: {e}")
             print("Creating new model instead")
             model = create_model()
+            
+            # Save the new model to replace the incompatible one
+            save_model(model, os.path.basename(model_path))
+            print(f"Created and saved new model to replace incompatible file")
     else:
         print(f"Model weights not found: {model_path}")
         print("Creating new model instead")
@@ -187,8 +204,54 @@ def initialize_nnue(model_path=None):
     if model_path is None:
         model_path = os.path.join("saved_models", "default_weights.pt")
     
-    # Load model
-    nnue_model = load_model(model_path)
+    # Create a model with the 16M parameter architecture
+    model = create_model()
+    
+    # Try to load weights if the file exists
+    if os.path.exists(model_path):
+        try:
+            # Try different loading approaches to handle PyTorch version differences
+            try:
+                # First try with weights_only=False
+                model.load_state_dict(torch.load(model_path, weights_only=False))
+                print(f"Loaded model from {model_path}")
+            except:
+                try:
+                    # If that fails, try with map_location
+                    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+                    print(f"Loaded model from {model_path} using map_location")
+                except Exception as e:
+                    print(f"Error loading weights with map_location: {e}")
+                    print("Creating new model instead")
+                    model = create_model()
+                    
+                    # Save the new model to replace the incompatible one
+                    save_path = os.path.join("saved_models", "default_weights.pt")
+                    torch.save(model.state_dict(), save_path)
+                    print(f"Created and saved new model to replace incompatible file")
+        except Exception as e:
+            print(f"Error loading weights: {e}")
+            print(f"Creating new model instead")
+            model = create_model()
+            
+            # Save the new model to replace the incompatible one
+            save_path = os.path.join("saved_models", "default_weights.pt")
+            torch.save(model.state_dict(), save_path)
+            print(f"Created and saved new model to replace incompatible file")
+    else:
+        print(f"Model weights not found: {model_path}")
+        print(f"Creating new model instead")
+        
+        # Create directory if it doesn't exist
+        os.makedirs("saved_models", exist_ok=True)
+        
+        # Save the new model for future use
+        save_path = os.path.join("saved_models", "default_weights.pt")
+        torch.save(model.state_dict(), save_path)
+        print(f"Created default model at {save_path}")
+    
+    # Set the global model
+    nnue_model = model
     
     # Reset accumulator
     current_accumulator = None
@@ -216,77 +279,44 @@ def evaluate_position(board):
         initialize_nnue()
     
     try:
-        # Try to use NNUE evaluation
-        if last_board_fen and current_accumulator is not None:
-            # Check if we can do an incremental update
-            last_board = chess.Board(last_board_fen)
-            
-            # Get the last move
-            moves = list(board.move_stack)
-            if len(moves) > len(last_board.move_stack) and len(last_board.move_stack) > 0:
-                last_move = moves[-1]
-                
-                # Calculate feature differences
-                add_features = get_feature_diff(last_board, last_move)
-                
-                # Update incrementally
-                with torch.no_grad():
-                    score, current_accumulator = nnue_model.incremental_forward(
-                        current_accumulator, 
-                        add_features, 
-                        None,
-                        board=board,
-                        move=None
-                    )
+        # Always do a full forward pass for reliability
+        features = board_to_features(board)
+        
+        # Check if features have the correct shape
+        if features.shape != (1, 24, 8, 8):
+            print(f"Warning: Features have incorrect shape: {features.shape}, expected (1, 24, 8, 8)")
+            # Try to reshape if possible
+            if features.numel() == 1536:  # 1 * 24 * 8 * 8
+                features = features.reshape(1, 24, 8, 8)
             else:
-                # Full evaluation if incremental is not possible
-                features = board_to_features(board)
-                
-                with torch.no_grad():
-                    # Full forward pass
-                    score = nnue_model(features)
-                    
-                    # Update accumulator for next incremental update
-                    _, current_accumulator = nnue_model.incremental_forward(
-                        None, 
-                        None, 
-                        None, 
-                        board=board
-                    )
+                # If reshaping is not possible, regenerate features
+                print("Regenerating features with correct shape")
+                features = torch.zeros(1, 24, 8, 8)
+        
+        with torch.no_grad():
+            # Full forward pass
+            score = nnue_model(features)
             
-            # Store current board FEN for future incremental updates
-            last_board_fen = board.fen()
+            # Check if score is a valid tensor
+            if not isinstance(score, torch.Tensor):
+                print(f"Warning: Score is not a tensor: {type(score)}")
+                raise ValueError("Invalid score type")
             
-            # Return the score from current player's perspective
-            perspective = 1 if board.turn == chess.WHITE else -1
-            return perspective * score.item()
-            
-        else:
-            # First evaluation, do a full forward pass
-            features = board_to_features(board)
-            
-            with torch.no_grad():
-                # Full forward pass
-                score = nnue_model(features)
-                
-                # Initialize accumulator for future incremental updates
-                _, current_accumulator = nnue_model.incremental_forward(
-                    None, 
-                    None, 
-                    None, 
-                    board=board
-                )
-            
-            # Store current board FEN for future incremental updates
-            last_board_fen = board.fen()
-            
-            # Return the score from current player's perspective
-            perspective = 1 if board.turn == chess.WHITE else -1
-            return perspective * score.item()
+            # Check if score has a valid shape
+            if score.numel() != 1:
+                print(f"Warning: Score has unexpected shape: {score.shape}")
+                score = torch.tensor([[0.0]])
+        
+        # Return the score from current player's perspective
+        perspective = 1 if board.turn == chess.WHITE else -1
+        return perspective * score.item()
             
     except Exception as e:
         # If NNUE fails, fall back to classical evaluation
-        print(f"NNUE evaluation failed: {e}, falling back to classical evaluation")
+        print(f"NNUE evaluation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        print("Falling back to classical evaluation")
         return classical_evaluate(board)
 
 def get_attack_map(board, color):

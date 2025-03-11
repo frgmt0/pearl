@@ -9,11 +9,8 @@ from tqdm import tqdm
 import os
 import pandas as pd
 
-# Import from our new model system
-from src.engine.nnue.model_factory import create_model, get_model_type
-from src.engine.nnue.model_handler import save_model, load_model
-from src.engine.nnue.standard_network import board_to_features as standard_features
-from src.engine.nnue.pearl_network import board_to_features as pearl_features
+# Import directly from the network module
+from src.engine.nnue.network import board_to_features
 
 class ChessPositionDataset(Dataset):
     """
@@ -52,6 +49,10 @@ class ChessPositionDataset(Dataset):
             else:
                 normalized_eval = torch.tensor([eval_score / 600], dtype=torch.float32)
             
+            # Ensure features require gradients
+            if not features.requires_grad:
+                features = features.detach().clone().requires_grad_(True)
+                
             return features, normalized_eval
             
         # Otherwise, convert to string if needed
@@ -63,11 +64,12 @@ class ChessPositionDataset(Dataset):
         # Convert FEN to board
         board = chess.Board(fen)
         
-        # Convert board to features based on model type
-        if self.model_type == "standard":
-            features = standard_features(board)
-        else:  # pearl or pearlxl (they use the same feature extraction)
-            features = pearl_features(board)
+        # Convert board to features
+        features = board_to_features(board)
+        
+        # Ensure features require gradients
+        if not features.requires_grad:
+            features = features.detach().clone().requires_grad_(True)
         
         # Normalize evaluation score to [-1, 1] range
         # Most engines use centipawn values where 100 cp = 1 pawn
@@ -98,7 +100,8 @@ class NNUETrainer:
         
         # Create model if none provided
         if model is None:
-            self.model = create_model(model_type)
+            from src.engine.nnue.network import NNUE
+            self.model = NNUE()
         else:
             self.model = model
             
@@ -221,10 +224,10 @@ class NNUETrainer:
             
             # Save model weights
             if save_interval and (epoch + 1) % save_interval == 0:
-                save_model(self.model, f"{self.model_type}_epoch_{epoch+1}")
+                self.save_model(f"{self.model_type}_epoch_{epoch+1}")
         
         # Save final weights
-        save_model(self.model)
+        self.save_model()
         
         return history
     
@@ -258,212 +261,6 @@ class NNUETrainer:
         
         return val_loss / len(data_loader)
     
-    def load_dataset_from_pgn(self, pgn_file, num_positions=10000, engine_depth=15, feedback=None):
-        """
-        Generate a dataset from PGN file using an external engine for evaluation.
-        
-        Args:
-            pgn_file: Path to PGN file
-            num_positions: Number of positions to extract
-            engine_depth: Depth for engine analysis
-            feedback: Optional dictionary with game outcome feedback for emphasis
-                     Format: {"result": "win/loss", "emphasis": float}
-                     Additional selective learning options:
-                     {"learn_from_winner": True, "engine_color": "white"}
-                     For inverse learning (learn what NOT to do):
-                     {"inverse_learning": True, "result": "loss"} - will invert evaluations
-            
-        Returns:
-            ChessPositionDataset
-        """
-        import chess.pgn
-        from src.utils.api.stockfish import StockfishAPI, MockStockfishAPI
-        from src.engine.finetune import SelfPlayData
-        
-        # Use local evaluation instead of trying to use StockfishAPI
-        from src.engine.score import evaluate_position
-        print("Using local evaluation for position scoring")
-        has_stockfish = False  # This is now a misnomer, but keeping for code compatibility
-        
-        # Load game from PGN
-        try:
-            with open(pgn_file, 'r') as f:
-                game = chess.pgn.read_game(f)
-        except Exception as e:
-            print(f"Error loading PGN file: {e}")
-            return None
-        
-        if not game:
-            print("No game found in PGN file")
-            return None
-            
-        # Extract result
-        result = game.headers.get("Result", "*")
-        if result == "1-0":
-            final_result = "white_win"
-        elif result == "0-1":
-            final_result = "black_win"
-        elif result == "1/2-1/2":
-            final_result = "draw"
-        else:
-            final_result = "draw"  # Default to draw for unknown results
-        
-        print(f"Game result: {final_result}")
-        
-        # Check selective learning options
-        learn_from_winner = False
-        engine_color = None
-        winning_color = "white" if final_result == "white_win" else "black" if final_result == "black_win" else None
-        
-        if feedback and isinstance(feedback, dict):
-            learn_from_winner = feedback.get('learn_from_winner', False)
-            engine_color = feedback.get('engine_color', None)
-            
-            if learn_from_winner:
-                print(f"Selective learning enabled: Learning only from the winning side's moves")
-                if winning_color:
-                    print(f"Winning color: {winning_color}")
-                    if engine_color:
-                        print(f"Engine playing as: {engine_color}")
-                        if engine_color != winning_color:
-                            print(f"Learning from opponent (Stockfish) winning moves")
-                else:
-                    print(f"Game ended in a draw, learning from both sides")
-                    # In a draw, we'll learn from both sides
-                    learn_from_winner = False
-        
-        # Create data collector
-        data = SelfPlayData(max_positions=num_positions)
-        
-        # Traverse game and collect positions
-        board = game.board()
-        moves = list(game.mainline_moves())
-        positions = []
-        
-        # Collect FENs and evaluations
-        game_fens = []
-        evaluations = []
-        position_quality = []  # Track position significance
-        
-        # Starting position
-        game_fens.append(board.fen())
-        
-        # Add evaluation for starting position
-        # We're now using local evaluation and the has_stockfish flag is just for compatibility
-        eval_score = evaluate_position(board)
-        evaluations.append(eval_score)
-        position_quality.append(0.5)  # Medium quality for starting position
-        has_stockfish = True  # Set to true since we're collecting evaluations
-        
-        # Determine which moves to analyze based on selective learning options
-        if learn_from_winner and winning_color:
-            move_indices = []
-            
-            # For white winning, collect white's moves (even indices starting from 0)
-            # For black winning, collect black's moves (odd indices starting from 1)
-            if winning_color == "white":
-                move_indices = list(range(0, len(moves), 2))
-                print(f"Collecting {len(move_indices)} white moves (winner)")
-            else:  # black winning
-                move_indices = list(range(1, len(moves), 2))
-                print(f"Collecting {len(move_indices)} black moves (winner)")
-                
-            # If engine_color is specified and different from winning color,
-            # we want to learn from the opponent's (Stockfish's) winning moves
-            if engine_color and engine_color != winning_color:
-                # Invert the selection to learn from opponent's winning moves
-                move_indices = [i for i in range(len(moves)) if i not in move_indices]
-                print(f"Inverted selection: Learning from {len(move_indices)} opponent (Stockfish) winning moves")
-        else:
-            # Use all moves
-            move_indices = list(range(len(moves)))
-            
-        # Limit to requested number of positions
-        move_indices = move_indices[:min(num_positions, len(move_indices))]
-            
-        # Apply moves and collect positions
-        print(f"Analyzing {len(moves)} moves from PGN...")
-        for i, move in enumerate(moves):
-            # Skip if we've collected enough positions
-            if len(game_fens) - 1 >= num_positions:  # -1 because we already added the starting position
-                break
-                
-            # Make the move
-            board.push(move)
-            
-            # Only collect this position if it's from the side we want to learn from
-            if learn_from_winner and i not in move_indices:
-                continue
-                
-            # Add position to our dataset
-            game_fens.append(board.fen())
-            
-            # Get evaluation using our local evaluation function
-            eval_score = evaluate_position(board)
-            evaluations.append(eval_score)
-            
-            # Calculate position significance
-            # Positions later in the game and decisive positions get higher quality
-            move_progress = min(1.0, i / max(20, len(moves)))  # 0.0 to 1.0 progress through game
-            eval_magnitude = min(1.0, abs(eval_score) / 300)  # 0.0 to 1.0 based on evaluation strength
-            
-            # Combined quality score (0.5 to 1.5)
-            quality = 0.5 + (move_progress * 0.5) + (eval_magnitude * 0.5)
-            position_quality.append(quality)
-                
-            # Print progress
-            if i % 10 == 0:
-                print(f"Processed {i} moves...")
-        
-        # Apply feedback emphasis if provided
-        if feedback and isinstance(feedback, dict):
-            emphasis = feedback.get('emphasis', 1.0)
-            result_type = feedback.get('result', None)
-            inverse_learning = feedback.get('inverse_learning', False)
-            
-            # Only apply emphasis if the result matches the game outcome
-            if (result_type == 'win' and final_result in ['white_win', 'black_win']) or \
-               (result_type == 'loss' and final_result in ['white_win', 'black_win']):
-                
-                print(f"Applying feedback emphasis factor: {emphasis}")
-                
-                # For losses with inverse learning, we learn what NOT to do by inverting evaluations
-                if inverse_learning and result_type == 'loss':
-                    print(f"Applying INVERSE LEARNING: Learning what NOT to do by inverting evaluations")
-                    if evaluations:
-                        # Invert evaluations to learn the opposite of what was played
-                        evaluations = [-eval_score * emphasis for eval_score in evaluations]
-                # Normal learning with emphasis
-                else:
-                    # Modify evaluations to emphasize this game's learning
-                    if evaluations:
-                        # Scale existing evaluations to emphasize their importance
-                        evaluations = [eval_score * emphasis for eval_score in evaluations]
-        
-        # Add game to dataset
-        if len(evaluations) == len(game_fens):
-            data.add_game(game_fens, final_result, evaluations, position_quality)
-            print(f"Added game with {len(game_fens)} positions and evaluations")
-        else:
-            # Fallback to result-based scoring if evaluations are missing
-            data.add_game(game_fens, final_result)
-            print(f"Added game with {len(game_fens)} positions using result-based scoring")
-        
-        # Augment the dataset to create more training samples
-        # Create the original dataset from the played game
-        original_dataset = list(data.positions)
-        
-        # Augment the dataset to create 5x more training examples
-        print(f"Augmenting dataset from {len(original_dataset)} to ", end="")
-        augmented_data = augment_dataset(original_dataset, augmentation_factor=5)
-        print(f"{len(augmented_data)} positions")
-        
-        # Replace the positions with the augmented dataset
-        data.positions = augmented_data
-        
-        # Create dataset with the appropriate model type
-        return data.create_dataset(model_type=self.model_type)
-    
     def save_model(self, name=None):
         """
         Save the model weights.
@@ -474,7 +271,20 @@ class NNUETrainer:
         Returns:
             Path to the saved weights file
         """
-        return save_model(self.model, name)
+        # Create directory if it doesn't exist
+        os.makedirs("saved_models", exist_ok=True)
+        
+        # Generate filename
+        if name:
+            filename = f"saved_models/{name}.pt"
+        else:
+            filename = f"saved_models/{self.model_type}_weights.pt"
+        
+        # Save model weights
+        torch.save(self.model.state_dict(), filename)
+        print(f"Model weights saved to {filename}")
+        
+        return filename
 
 def create_position_variants(board, score, num_variants=5):
     """

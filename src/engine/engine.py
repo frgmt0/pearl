@@ -15,7 +15,7 @@ class NNUEEngine:
     Main chess engine class that integrates NNUE evaluation with
     alpha-beta search to find the best moves.
     """
-    def __init__(self, name="Pearl NNUE", depth=7, time_limit_ms=3000, enable_learning=True, model_type=None):
+    def __init__(self, name="Pearl NNUE", depth=7, time_limit_ms=3000, enable_learning=True):
         """
         Initialize a new chess engine.
         
@@ -24,7 +24,6 @@ class NNUEEngine:
             depth: Default search depth
             time_limit_ms: Default time limit in milliseconds
             enable_learning: Whether to enable real-time learning
-            model_type: Not used (kept for backward compatibility)
         """
         self.name = name
         self.depth = depth
@@ -367,37 +366,26 @@ class NNUEEngine:
         # Use our new save_model function
         return save_model(self.model, name)
     
-    def load_model(self, path=None, model_type=None):
+    def load_model(self, path=None):
         """
         Load neural network model weights.
         
         Args:
-            path: Path to weights file (None for latest)
-            model_type: Type of model to load (None for current type)
+            path: Path to weights file (None for default)
             
         Returns:
             True if successful, False otherwise
         """
         try:
-            # Use current model type if none specified
-            if model_type is None:
-                model_type = self.model_type
-                
-            # If path not specified, find the best match
+            # If path not specified, use default
             if path is None:
-                path = find_best_matching_model(model_type)
-                if path is None:
-                    print(f"No {model_type} model found")
-                    return False
+                path = os.path.join("saved_models", "default_weights.pt")
             
             # Store the path for reference
             self.current_weights_path = path
             
-            # Update model type
-            self.model_type = model_type
-            
-            # Load model using our new load_model function
-            self.model = load_model(path, model_type)
+            # Load model
+            self.model = load_model(path)
             
             # Update fine-tuner model if available
             if self.enable_learning and self.finetuner:

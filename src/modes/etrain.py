@@ -76,7 +76,10 @@ class PearlTrainer:
         print(f"\033[1;36mLoading dataset from \033[1;33m{csv_path}\033[1;36m...\033[0m")
         
         # Load CSV file
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(csv_path, skip_blank_lines=True)
+        
+        # Remove any empty rows
+        df = df.dropna(subset=['move_sequence'])
         
         if max_games is not None:
             # Limit to max_games
@@ -88,52 +91,63 @@ class PearlTrainer:
         position_data = []
         
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing games"):
-            # Get move sequence and evaluations
-            move_sequence = row['move_sequence'].split(',')
-            evaluations = [float(eval_str) for eval_str in row['evaluations'].split(',')]
-            result = row['result']
-            
-            # Convert result to score (-1, 0, 1)
-            result_score = 0
-            if result == "1-0":
-                result_score = 1
-            elif result == "0-1":
-                result_score = -1
+            try:
+                # Get move sequence and result
+                move_sequence = row['move_sequence'].split()  # Split by whitespace
+                result = row['result']
                 
-            # Create board and play through moves to create training samples
-            board = chess.Board()
-            
-            # Process each move
-            for i, move_uci in enumerate(move_sequence):
-                # Skip if we don't have a matching evaluation
-                if i >= len(evaluations):
-                    break
+                # Convert result to score (-1, 0, 1)
+                result_score = 0
+                if result == "1-0":
+                    result_score = 1
+                elif result == "0-1":
+                    result_score = -1
+                elif result == "1/2-1/2":
+                    result_score = 0
                     
-                # Get the position before the move
-                position_fen = board.fen()
+                # Create board and play through moves to create training samples
+                board = chess.Board()
                 
-                # Get the move evaluation
-                # Blend of immediate evaluation and final result
-                # Weight the result more as the game progresses
-                move_num = i // 2  # which move number we're on (0, 1, 2...)
-                progress = min(1.0, move_num / 40)  # progress through game (0.0 to 1.0)
-                
-                # Blend immediate evaluation with final result
-                blended_eval = (1 - progress) * evaluations[i] + progress * result_score * 100
-                
-                # Cap evaluation to reasonable values
-                capped_eval = max(-600, min(600, blended_eval))
-                
-                # Add training example
-                position_data.append((position_fen, capped_eval))
-                
-                # Make the move
-                try:
-                    move = chess.Move.from_uci(move_uci)
-                    board.push(move)
-                except Exception as e:
-                    print(f"Error processing move {move_uci}: {e}")
-                    break
+                # Process each move
+                for i, move_san in enumerate(move_sequence):
+                    # Get the position before the move
+                    position_fen = board.fen()
+                    
+                    # Since we don't have evaluations, we'll use a combination of:
+                    # 1. Classical evaluation of the current position
+                    # 2. The final game result (weighted more as the game progresses)
+                    
+                    # Get classical evaluation
+                    classical_eval = classical_evaluate(board) / 100.0  # Scale down to -6 to 6 range
+                    
+                    # Calculate progress through the game (0.0 to 1.0)
+                    move_num = i // 2  # which move number we're on (0, 1, 2...)
+                    progress = min(1.0, move_num / 40)  # progress through game (0.0 to 1.0)
+                    
+                    # Blend classical evaluation with final result
+                    # As the game progresses, we trust the result more than the evaluation
+                    blended_eval = (1 - progress) * classical_eval + progress * result_score * 6
+                    
+                    # Cap evaluation to reasonable values
+                    capped_eval = max(-6, min(6, blended_eval)) * 100  # Scale back to centipawns
+                    
+                    # Add training example
+                    position_data.append((position_fen, capped_eval))
+                    
+                    # Make the move
+                    try:
+                        # Convert SAN to move object
+                        move = board.parse_san(move_san)
+                        board.push(move)
+                    except Exception as e:
+                        print(f"Error processing move {move_san} at position {i} in game {idx}: {e}")
+                        # Print the board and move for debugging
+                        print(f"Board: {board}")
+                        print(f"Move: {move_san}")
+                        break
+            except Exception as e:
+                print(f"Error processing game {idx}: {e}")
+                continue
         
         print(f"\033[1;32mCreated \033[1;33m{len(position_data)}\033[1;32m training examples\033[0m")
         
@@ -147,9 +161,9 @@ class PearlTrainer:
         print(f"\033[1;32m - Training set: \033[1;33m{len(train_data)}\033[1;32m examples\033[0m")
         print(f"\033[1;32m - Validation set: \033[1;33m{len(val_data)}\033[1;32m examples\033[0m")
         
-        # Create datasets - using 'standard' as the model type for our new network
-        train_dataset = ChessPositionDataset(train_data, model_type="standard")
-        val_dataset = ChessPositionDataset(val_data, model_type="standard")
+        # Create datasets
+        train_dataset = ChessPositionDataset(train_data)
+        val_dataset = ChessPositionDataset(val_data)
         
         return train_dataset, val_dataset
     
@@ -201,26 +215,41 @@ class PearlTrainer:
             train_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
             
             for features, targets in train_bar:
-                # Move to device
-                features = features.to(self.device)
-                targets = targets.to(self.device)
-                
-                # Reset gradients
-                self.optimizer.zero_grad()
-                
-                # Forward pass
-                outputs = self.model(features)
-                
-                # Calculate loss
-                loss = self.criterion(outputs, targets)
-                
-                # Backward pass and optimize
-                loss.backward()
-                self.optimizer.step()
-                
-                # Update statistics
-                train_loss += loss.item() * features.size(0)
-                train_bar.set_postfix(loss=loss.item())
+                try:
+                    # Move to device
+                    features = features.to(self.device)
+                    targets = targets.to(self.device)
+                    
+                    # Ensure features require gradients
+                    if not features.requires_grad:
+                        features = features.detach().clone().requires_grad_(True)
+                    
+                    # Reset gradients
+                    self.optimizer.zero_grad()
+                    
+                    # Forward pass
+                    outputs = self.model(features)
+                    
+                    # Ensure outputs and targets have the same shape
+                    if outputs.shape != targets.shape:
+                        # Reshape targets to match outputs
+                        targets = targets.view(outputs.shape)
+                    
+                    # Calculate loss
+                    loss = self.criterion(outputs, targets)
+                    
+                    # Backward pass and optimize
+                    loss.backward()
+                    self.optimizer.step()
+                    
+                    # Update statistics
+                    train_loss += loss.item() * features.size(0)
+                    train_bar.set_postfix(loss=loss.item())
+                except Exception as e:
+                    print(f"Error during training batch: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
             
             # Calculate average training loss
             train_loss /= len(train_dataset)
@@ -283,18 +312,27 @@ class PearlTrainer:
         
         with torch.no_grad():
             for features, targets in data_loader:
-                # Move to device
-                features = features.to(self.device)
-                targets = targets.to(self.device)
-                
-                # Forward pass
-                outputs = self.model(features)
-                
-                # Calculate loss
-                loss = self.criterion(outputs, targets)
-                
-                # Update statistics
-                total_loss += loss.item() * features.size(0)
+                try:
+                    # Move to device
+                    features = features.to(self.device)
+                    targets = targets.to(self.device)
+                    
+                    # Forward pass
+                    outputs = self.model(features)
+                    
+                    # Ensure outputs and targets have the same shape
+                    if outputs.shape != targets.shape:
+                        # Reshape targets to match outputs
+                        targets = targets.view(outputs.shape)
+                    
+                    # Calculate loss
+                    loss = self.criterion(outputs, targets)
+                    
+                    # Update statistics
+                    total_loss += loss.item() * features.size(0)
+                except Exception as e:
+                    print(f"Error during evaluation batch: {e}")
+                    continue
         
         # Calculate average loss
         avg_loss = total_loss / len(data_loader.dataset)
@@ -454,13 +492,13 @@ class PearlTrainer:
             'mae': mae
         }
 
-def train_model(dataset_path, output_path=None, epochs=50, batch_size=128, 
+def train_model(dataset_path="dataset/dataset.csv", output_path=None, epochs=50, batch_size=128, 
                 learning_rate=0.001, max_games=None, patience=5):
     """
     Train a model on a dataset.
     
     Args:
-        dataset_path: Path to the dataset CSV
+        dataset_path: Path to the dataset CSV (default: dataset/dataset.csv)
         output_path: Path to save the model (None for default)
         epochs: Number of training epochs
         batch_size: Batch size for training
@@ -476,8 +514,17 @@ def train_model(dataset_path, output_path=None, epochs=50, batch_size=128,
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = os.path.join("saved_models", f"nnue_weights_{timestamp}.pt")
     
+    # Ensure the dataset path exists
+    if not os.path.exists(dataset_path):
+        # Try to find the dataset in the dataset directory
+        if os.path.exists(os.path.join("dataset", os.path.basename(dataset_path))):
+            dataset_path = os.path.join("dataset", os.path.basename(dataset_path))
+        else:
+            raise FileNotFoundError(f"Dataset not found at {dataset_path}")
+    
     print(f"\033[1;35m━━━━━━━━━━━━━━━━━━━ Pearl Chess Engine Training ━━━━━━━━━━━━━━━━━━━\033[0m")
     print(f"\033[1;36mStarting training session at \033[1;33m{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\033[0m")
+    print(f"\033[1;36mDataset: \033[1;33m{dataset_path}\033[0m")
     print(f"\033[1;36mOutput model: \033[1;33m{output_path}\033[0m")
     print(f"\033[1;36mBatch size: \033[1;33m{batch_size}\033[0m | \033[1;36mLearning rate: \033[1;33m{learning_rate}\033[0m")
     
@@ -496,6 +543,9 @@ def train_model(dataset_path, output_path=None, epochs=50, batch_size=128,
     # Plot training history
     plot_path = os.path.splitext(output_path)[0] + "_training.png"
     trainer.plot_history(save_path=plot_path)
+    
+    # Ensure the saved_models directory exists
+    os.makedirs("saved_models", exist_ok=True)
     
     # Save the model
     trainer.save_model(output_path)

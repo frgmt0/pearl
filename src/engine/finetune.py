@@ -576,8 +576,20 @@ class RealtimeFinetuner:
         Returns:
             Path to the saved weights file
         """
-        from src.engine.nnue.model_handler import save_model
-        return save_model(self.model, name)
+        # Create directory if it doesn't exist
+        os.makedirs("saved_models", exist_ok=True)
+        
+        # Generate filename
+        if name:
+            filename = f"saved_models/{name}.pt"
+        else:
+            filename = f"saved_models/finetune_weights.pt"
+        
+        # Save model weights
+        torch.save(self.model.state_dict(), filename)
+        print(f"Model weights saved to {filename}")
+        
+        return filename
     
     def reset_to_default(self):
         """

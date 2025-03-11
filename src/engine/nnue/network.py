@@ -2,8 +2,7 @@
 Advanced Neural Network for Chess Position Evaluation (NNUE)
 
 This module implements a convolutional residual network for chess position evaluation,
-inspired by AlphaZero and modern chess engines. The architecture has approximately
-16 million parameters.
+with approximately 16 million parameters as specified.
 """
 
 import torch
@@ -78,15 +77,14 @@ class ResidualBlock(nn.Module):
 
 class NNUE(nn.Module):
     """
-    Advanced Neural Network for Chess Position Evaluation.
+    Advanced Neural Network for Chess Position Evaluation (16M parameters).
     
     Architecture:
-    1. Input convolutional layer (24 input planes -> 256 filters)
-    2. Residual blocks (20 blocks with 256 filters each)
-    3. Policy head (move prediction - future use)
-    4. Value head (position evaluation)
-    5. Threat analysis module with self-attention
-    6. Integration layer combining value and threat analysis
+    1. Input: 8x8x24 (12 piece channels + 12 additional feature channels)
+    2. Feature Extraction: 20 residual blocks with 256 filters each
+    3. Policy Head: For move prediction (future use)
+    4. Value Head: For position evaluation
+    5. Threat Analysis: Special attention mechanism for piece relationships
     """
     def __init__(self, num_blocks=NUM_RESIDUAL_BLOCKS):
         super(NNUE, self).__init__()
@@ -100,32 +98,210 @@ class NNUE(nn.Module):
             ResidualBlock(RESIDUAL_FILTERS) for _ in range(num_blocks)
         ])
         
-        # Add self-attention layer after some residual blocks
-        self.attention = SelfAttention(RESIDUAL_FILTERS)
-        
-        # Policy head (for future use in move prediction)
+        # Policy head (for future use in MCTS)
         self.policy_conv = nn.Conv2d(RESIDUAL_FILTERS, 73, kernel_size=1)
-        self.policy_fc = nn.Linear(73 * 8 * 8, POLICY_OUTPUT_SIZE)
+        self.policy_bn = nn.BatchNorm2d(73)
+        self.policy_fc = nn.Linear(73 * BOARD_SIZE * BOARD_SIZE, POLICY_OUTPUT_SIZE)
         
-        # Value head
+        # Value head - outputs 64 features for integration
         self.value_conv = nn.Conv2d(RESIDUAL_FILTERS, 8, kernel_size=1)
-        self.value_fc1 = nn.Linear(8 * 8 * 8, VALUE_HIDDEN_SIZE)
-        self.value_fc2 = nn.Linear(VALUE_HIDDEN_SIZE, 64)
+        self.value_bn = nn.BatchNorm2d(8)
+        self.value_fc1 = nn.Linear(8 * BOARD_SIZE * BOARD_SIZE, VALUE_HIDDEN_SIZE)
+        self.value_fc2 = nn.Linear(VALUE_HIDDEN_SIZE, 64)  # Output 64 features for integration
+        # We don't use value_fc3 in the forward pass anymore, but keep it for compatibility with saved models
         self.value_fc3 = nn.Linear(64, OUTPUT_SIZE)
         
-        # Threat analysis module
-        self.threat_fc1 = nn.Linear(RESIDUAL_FILTERS * 8 * 8, 512)
-        self.threat_fc2 = nn.Linear(512, THREAT_HIDDEN_SIZE)
-        self.threat_fc3 = nn.Linear(THREAT_HIDDEN_SIZE, 128)
-        self.threat_output = nn.Linear(128, OUTPUT_SIZE)
+        # Threat analysis module - outputs 128 features for integration
+        self.threat_attention = SelfAttention(RESIDUAL_FILTERS)
+        self.threat_conv = nn.Conv2d(RESIDUAL_FILTERS, 64, kernel_size=1)
+        self.threat_bn = nn.BatchNorm2d(64)
+        self.threat_fc1 = nn.Linear(64 * BOARD_SIZE * BOARD_SIZE, THREAT_HIDDEN_SIZE)
+        self.threat_fc2 = nn.Linear(THREAT_HIDDEN_SIZE, 128)  # Output 128 features for integration
         
-        # Final integration layer
-        self.final_fc = nn.Linear(2, OUTPUT_SIZE)
+        # Integration layer - takes 64 (from value head) + 128 (from threat analysis) = 192 inputs
+        self.integration_fc = nn.Linear(64 + 128, OUTPUT_SIZE)
         
+        # Initialize weights
         self.initialize_weights()
+        
+    def forward(self, x):
+        try:
+            # Handle different input shapes
+            original_shape = x.shape
+            
+            # If input is 1D (flattened features), reshape to 4D
+            if x.dim() == 1:
+                x = x.view(1, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+            # If input is 2D (batch, flattened features), reshape to 4D
+            elif x.dim() == 2:
+                batch_size = x.size(0)
+                x = x.view(batch_size, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+            # If input is 3D (channels, height, width), add batch dimension
+            elif x.dim() == 3:
+                x = x.unsqueeze(0)  # Add batch dimension (1, C, H, W)
+            
+            # Now x should be 4D (batch, channels, height, width)
+            if x.dim() != 4:
+                print(f"Unexpected input shape: {original_shape}, reshaped to {x.shape}")
+                # Create a properly shaped tensor as fallback
+                x = torch.zeros(1, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE, device=x.device)
+            
+            # Ensure we have the correct input shape
+            batch_size, channels, height, width = x.shape
+            if channels != INPUT_CHANNELS or height != BOARD_SIZE or width != BOARD_SIZE:
+                print(f"Input shape mismatch: Expected (B, {INPUT_CHANNELS}, {BOARD_SIZE}, {BOARD_SIZE}), got {x.shape}")
+                
+                # Create a properly shaped tensor
+                x_proper = torch.zeros(batch_size, INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE, device=x.device)
+                
+                # Copy data if possible
+                min_channels = min(channels, INPUT_CHANNELS)
+                min_height = min(height, BOARD_SIZE)
+                min_width = min(width, BOARD_SIZE)
+                
+                x_proper[:, :min_channels, :min_height, :min_width] = x[:, :min_channels, :min_height, :min_width]
+                x = x_proper
+            
+            # Input layer
+            x = F.relu(self.input_bn(self.input_conv(x)))
+            
+            # Residual blocks
+            for block in self.residual_blocks:
+                x = block(x)
+            
+            # Store backbone output for multiple heads
+            backbone_out = x
+            
+            # Policy head (not used for evaluation, but included for completeness)
+            policy_out = F.relu(self.policy_bn(self.policy_conv(backbone_out)))
+            policy_out = policy_out.view(batch_size, -1)
+            policy_out = self.policy_fc(policy_out)
+            
+            # Value head
+            value_out = F.relu(self.value_bn(self.value_conv(backbone_out)))
+            value_out = value_out.view(batch_size, -1)
+            value_out = F.relu(self.value_fc1(value_out))
+            value_out = F.relu(self.value_fc2(value_out))
+            
+            # Threat analysis
+            threat_out = self.threat_attention(backbone_out)
+            threat_out = F.relu(self.threat_bn(self.threat_conv(threat_out)))
+            threat_out = threat_out.view(batch_size, -1)
+            threat_out = F.relu(self.threat_fc1(threat_out))
+            threat_out = F.relu(self.threat_fc2(threat_out))
+            
+            # Combine value and threat outputs
+            combined = torch.cat((value_out, threat_out), dim=1)
+            
+            # Final integration
+            final_out = self.integration_fc(combined)
+            
+            # Scale output to centipawns (approximately -1000 to 1000)
+            return 1000 * torch.tanh(final_out)
+            
+        except Exception as e:
+            # If there's an error in the forward pass, print it and return a default score
+            print(f"Error in NNUE forward pass: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Return a tensor with a default score of 0 that requires grad
+            result = torch.zeros(1, 1, requires_grad=True)
+            return result
+    
+    def incremental_forward(self, accumulator, add_features=None, remove_features=None, board=None, move=None):
+        """
+        Perform an incremental forward pass using the accumulator from a previous position.
+        This is more efficient than a full forward pass when only a few pieces have moved.
+        
+        Args:
+            accumulator: Previous accumulator state (None for initial calculation)
+            add_features: Features to add (None if using board/move)
+            remove_features: Features to remove (None if using board/move)
+            board: Chess board (alternative to add/remove features)
+            move: Move to apply (alternative to add/remove features)
+            
+        Returns:
+            Tuple of (evaluation score, new accumulator)
+        """
+        try:
+            # If no accumulator provided, do a full forward pass
+            if accumulator is None:
+                if board is not None:
+                    features = board_to_features(board)
+                    score = self.forward(features)
+                    return score, features
+                else:
+                    return None, None
+            
+            # If board and move are provided, calculate feature differences
+            if board is not None and move is not None:
+                try:
+                    # Get feature differences
+                    removed_features, added_features = get_feature_diff(board, move)
+                    
+                    # Update local variables to match parameter names
+                    remove_features = removed_features
+                    add_features = added_features
+                except Exception as e:
+                    print(f"Error calculating feature differences: {e}")
+                    # Fall back to full forward pass
+                    features = board_to_features(board.copy().push(move))
+                    score = self.forward(features)
+                    return score, features
+            
+            # If we have feature differences, apply them to the accumulator
+            if add_features is not None or remove_features is not None:
+                try:
+                    # Create a copy of the accumulator
+                    new_accumulator = accumulator.clone()
+                    
+                    # Apply feature differences
+                    if add_features is not None:
+                        new_accumulator[add_features] += 1.0
+                    
+                    if remove_features is not None:
+                        new_accumulator[remove_features] -= 1.0
+                    
+                    # Perform forward pass with the updated accumulator
+                    score = self.forward(new_accumulator)
+                    return score, new_accumulator
+                except Exception as e:
+                    print(f"Error applying feature differences: {e}")
+                    # Fall back to full forward pass if board is available
+                    if board is not None:
+                        features = board_to_features(board)
+                        score = self.forward(features)
+                        return score, features
+            
+            # If we have a board but no move, do a full forward pass
+            if board is not None:
+                features = board_to_features(board)
+                score = self.forward(features)
+                return score, features
+            
+            # If we have an accumulator but no changes, just return the score
+            score = self.forward(accumulator)
+            return score, accumulator
+        except Exception as e:
+            print(f"Error in incremental_forward: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Fall back to full forward pass if board is available
+            if board is not None:
+                try:
+                    features = board_to_features(board)
+                    score = self.forward(features)
+                    return score, features
+                except:
+                    pass
+            
+            # Last resort: return a default score
+            return torch.tensor([[0.0]]), None
     
     def initialize_weights(self):
-        # Initialize weights for convolutional layers
+        """Initialize weights with appropriate scaling for better training."""
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -133,436 +309,223 @@ class NNUE(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-    
-    def forward(self, x):
-        """
-        Full forward pass through the network.
-        
-        Args:
-            x: Features representing the board (24x8x8 tensor or flattened tensor)
-            
-        Returns:
-            Evaluation score in centipawns
-        """
-        # Handle different input shapes
-        if len(x.shape) == 1:
-            # If input is flattened, reshape to (24, 8, 8)
-            x = x.view(INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
-            
-            # Add batch dimension
-            x = x.unsqueeze(0)
-        elif len(x.shape) == 3:
-            # If we have a 3D tensor but no batch dimension
-            x = x.unsqueeze(0)
-            
-        # Input layer
-        x = F.relu(self.input_bn(self.input_conv(x)))
-        
-        # First half of residual blocks
-        for i in range(NUM_RESIDUAL_BLOCKS // 2):
-            x = self.residual_blocks[i](x)
-        
-        # Apply attention in the middle of the network
-        x = self.attention(x)
-        
-        # Second half of residual blocks
-        for i in range(NUM_RESIDUAL_BLOCKS // 2, NUM_RESIDUAL_BLOCKS):
-            x = self.residual_blocks[i](x)
-        
-        # Value head
-        value = F.relu(self.value_conv(x))
-        value = value.view(value.size(0), -1)  # Flatten
-        value = F.relu(self.value_fc1(value))
-        value = F.relu(self.value_fc2(value))
-        value = torch.tanh(self.value_fc3(value))  # Output between -1 and 1
-        
-        # Threat analysis head
-        threat = x.view(x.size(0), -1)  # Flatten
-        threat = F.relu(self.threat_fc1(threat))
-        threat = F.relu(self.threat_fc2(threat))
-        threat = F.relu(self.threat_fc3(threat))
-        threat = torch.tanh(self.threat_output(threat))  # Output between -1 and 1
-        
-        # Combine value and threat analysis
-        combined = torch.cat([value, threat], dim=1)
-        final_eval = torch.tanh(self.final_fc(combined))
-        
-        # Scale to centipawn value (factor of 600 gives a good range)
-        return 600 * final_eval
-        
-    def incremental_forward(self, accumulator, add_features=None, remove_features=None, board=None, move=None):
-        """
-        Update evaluation when a move is made.
-        For convolutional models, this is more complex than for fully-connected models.
-        We perform a semi-incremental update by updating only the affected input planes.
-        
-        Args:
-            accumulator: Dictionary with 'board' and 'features' keys, or None for first call
-            add_features: Dict with piece movement info (from get_feature_diff)
-            remove_features: Not used (for compatibility with interface)
-            board: Chess board (required if accumulator is None)
-            move: Move to apply (if any)
-            
-        Returns:
-            Updated evaluation score and updated accumulator
-        """
-        # For the first call, initialize the accumulator
-        if accumulator is None:
-            if board is None:
-                # Can't do anything without a board
-                return torch.tensor([[0.0]]), None
-                
-            # Initialize a new accumulator
-            features = board_to_features(board)
-            accumulator = {
-                'board': board.copy(),
-                'features': features,
-                'move': move.uci() if move else None
-            }
-            
-            # Run initial evaluation
-            evaluation = self.forward(features)
-            return evaluation, accumulator
-                
-        # For subsequent calls, update the accumulator
-        if not isinstance(accumulator, dict):
-            # Invalid accumulator, fall back to full evaluation
-            if board is not None:
-                features = board_to_features(board)
-                new_accumulator = {
-                    'board': board.copy(),
-                    'features': features,
-                    'move': move.uci() if move else None
-                }
-                evaluation = self.forward(features)
-                return evaluation, new_accumulator
-            return torch.tensor([[0.0]]), None
-            
-        # Extract the board and previous features from accumulator
-        prev_board = accumulator.get('board')
-        prev_features = accumulator.get('features')
-        
-        if prev_board is None or prev_features is None:
-            # Invalid accumulator, fall back to full evaluation
-            if board is not None:
-                features = board_to_features(board)
-                new_accumulator = {
-                    'board': board.copy(),
-                    'features': features,
-                    'move': move.uci() if move else None
-                }
-                evaluation = self.forward(features)
-                return evaluation, new_accumulator
-            return torch.tensor([[0.0]]), None
-            
-        # Make a copy of the board to apply the move
-        updated_board = prev_board.copy()
-        
-        # First, check if we've been given a move directly
-        if move:
-            try:
-                updated_board.push(move)
-            except:
-                # Invalid move, fall back to board if provided
-                if board is not None:
-                    updated_board = board.copy()
-                else:
-                    # Can't proceed with valid state
-                    return torch.tensor([[0.0]]), None
-        # Then check if the accumulator contains move information
-        elif accumulator.get('move'):
-            try:
-                move_uci = accumulator.get('move')
-                move = chess.Move.from_uci(move_uci)
-                updated_board.push(move)
-            except:
-                # Invalid move, fall back to board if provided
-                if board is not None:
-                    updated_board = board.copy()
-                else:
-                    # Can't proceed with valid state
-                    return torch.tensor([[0.0]]), None
-        # Finally, if neither move nor accumulator.move, use provided board
-        elif board is not None:
-            updated_board = board.copy()
-                
-        # Update only the affected features rather than regenerating all
-        if add_features and remove_features:
-            # For incremental updates, we need to track what specific pieces changed
-            updated_features = update_features_incrementally(prev_features, updated_board, add_features, remove_features)
-        else:
-            # Fall back to regenerating all features if no specific change info
-            updated_features = board_to_features(updated_board)
-        
-        # Run the full forward pass with the updated features
-        evaluation = self.forward(updated_features)
-        
-        # Create updated accumulator
-        updated_accumulator = {
-            'board': updated_board,
-            'features': updated_features,
-            'move': None  # Reset for next move
-        }
-        
-        return evaluation, updated_accumulator
 
 def board_to_features(board):
     """
     Convert a chess board to input features for the neural network.
-    Creates a 24x8x8 tensor where:
-    - Channels 0-11: Piece type planes (6 piece types for each color)
-    - Channels 12-13: Side to move planes
-    - Channels 14-17: Castling rights planes
-    - Channel 18: En passant square
-    - Channels 19-20: Attack maps
-    - Channels 21-22: Mobility maps
-    - Channel 23: Move count (normalized)
     
     Args:
-        board: A chess.Board instance
+        board: Chess board position
         
     Returns:
-        Tensor of shape (24, 8, 8)
+        Tensor of shape (24, 8, 8) containing board features
     """
-    # Initialize empty tensor
-    features = torch.zeros(INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE, dtype=torch.float32)
-    
-    # Piece type and color planes (12 planes)
-    piece_idx = {
-        (chess.PAWN, chess.WHITE): 0,
-        (chess.KNIGHT, chess.WHITE): 1,
-        (chess.BISHOP, chess.WHITE): 2,
-        (chess.ROOK, chess.WHITE): 3,
-        (chess.QUEEN, chess.WHITE): 4,
-        (chess.KING, chess.WHITE): 5,
-        (chess.PAWN, chess.BLACK): 6,
-        (chess.KNIGHT, chess.BLACK): 7,
-        (chess.BISHOP, chess.BLACK): 8,
-        (chess.ROOK, chess.BLACK): 9,
-        (chess.QUEEN, chess.BLACK): 10,
-        (chess.KING, chess.BLACK): 11
-    }
-    
-    # Fill piece planes
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if piece:
-            rank = 7 - chess.square_rank(square)  # Flip rank (0-7 to 7-0)
-            file = chess.square_file(square)
-            features[piece_idx[(piece.piece_type, piece.color)], rank, file] = 1.0
-    
-    # Current turn (1 plane)
-    if board.turn == chess.WHITE:
-        features[12].fill_(1.0)
-    else:
-        features[13].fill_(1.0)
-    
-    # Castling rights (4 planes)
-    if board.has_kingside_castling_rights(chess.WHITE):
-        features[14].fill_(1.0)
-    if board.has_queenside_castling_rights(chess.WHITE):
-        features[15].fill_(1.0)
-    if board.has_kingside_castling_rights(chess.BLACK):
-        features[16].fill_(1.0)
-    if board.has_queenside_castling_rights(chess.BLACK):
-        features[17].fill_(1.0)
-    
-    # En passant square (1 plane)
-    if board.ep_square:
-        rank = 7 - chess.square_rank(board.ep_square)
-        file = chess.square_file(board.ep_square)
-        features[18, rank, file] = 1.0
-    
-    # Attack maps (2 planes for each side)
-    white_attacks = set()
-    black_attacks = set()
-    
-    for square in chess.SQUARES:
-        piece = board.piece_at(square)
-        if not piece:
-            continue
+    try:
+        # Initialize features tensor without requiring gradients initially
+        features = torch.zeros(INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE)
+        
+        # Piece type and color channels (12 channels)
+        piece_idx = {
+            (chess.PAWN, chess.WHITE): 0,
+            (chess.KNIGHT, chess.WHITE): 1,
+            (chess.BISHOP, chess.WHITE): 2,
+            (chess.ROOK, chess.WHITE): 3,
+            (chess.QUEEN, chess.WHITE): 4,
+            (chess.KING, chess.WHITE): 5,
+            (chess.PAWN, chess.BLACK): 6,
+            (chess.KNIGHT, chess.BLACK): 7,
+            (chess.BISHOP, chess.BLACK): 8,
+            (chess.ROOK, chess.BLACK): 9,
+            (chess.QUEEN, chess.BLACK): 10,
+            (chess.KING, chess.BLACK): 11
+        }
+        
+        # Fill piece channels
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece:
+                # Get piece index
+                idx = piece_idx.get((piece.piece_type, piece.color))
+                if idx is not None:
+                    # Convert square to rank and file (0-7)
+                    rank, file = divmod(square, 8)
+                    # Set feature (note: ranks are flipped in FEN, so we use 7-rank)
+                    features[idx][7-rank][file] = 1.0
+        
+        # Fill additional feature channels
+        
+        # Channel 12-13: Side to move
+        if board.turn == chess.WHITE:
+            features[12] = torch.ones(BOARD_SIZE, BOARD_SIZE)
+        else:
+            features[13] = torch.ones(BOARD_SIZE, BOARD_SIZE)
             
-        # Get attacks from this piece
-        attacks = board.attacks(square)
-        for attack_square in attacks:
-            if piece.color == chess.WHITE:
-                white_attacks.add(attack_square)
-            else:
-                black_attacks.add(attack_square)
-    
-    # Fill attack maps
-    for square in white_attacks:
-        rank = 7 - chess.square_rank(square)
-        file = chess.square_file(square)
-        features[19, rank, file] = 1.0
-        
-    for square in black_attacks:
-        rank = 7 - chess.square_rank(square)
-        file = chess.square_file(square)
-        features[20, rank, file] = 1.0
-    
-    # Mobility maps (2 planes) - where each side can move to
-    if board.turn == chess.WHITE:
-        for move in board.legal_moves:
-            to_rank = 7 - chess.square_rank(move.to_square)
-            to_file = chess.square_file(move.to_square)
-            features[21, to_rank, to_file] = 1.0
-    else:
-        for move in board.legal_moves:
-            to_rank = 7 - chess.square_rank(move.to_square)
-            to_file = chess.square_file(move.to_square)
-            features[22, to_rank, to_file] = 1.0
-    
-    # Move count plane (normalized)
-    move_count = len(board.move_stack)
-    normalized_move_count = min(1.0, move_count / 100.0)
-    features[23].fill_(normalized_move_count)
-    
-    return features
-
-def update_features_incrementally(prev_features, new_board, add_features, remove_features):
-    """
-    Update only the affected feature planes rather than regenerating all features.
-    
-    Args:
-        prev_features: Previous feature tensor (24, 8, 8)
-        new_board: Updated chess board
-        add_features: Features to add
-        remove_features: Features to remove
-        
-    Returns:
-        Updated feature tensor
-    """
-    # Clone the previous features as our starting point
-    features = prev_features.clone()
-    
-    # Update piece planes (0-11)
-    # We need to clear and repopulate the piece planes since the move affects positions
-    # Clear piece planes by zeroing them out
-    features[0:12, :, :] = 0.0
-    
-    # Repopulate piece planes
-    piece_idx = {
-        (chess.PAWN, chess.WHITE): 0,
-        (chess.KNIGHT, chess.WHITE): 1,
-        (chess.BISHOP, chess.WHITE): 2,
-        (chess.ROOK, chess.WHITE): 3,
-        (chess.QUEEN, chess.WHITE): 4,
-        (chess.KING, chess.WHITE): 5,
-        (chess.PAWN, chess.BLACK): 6,
-        (chess.KNIGHT, chess.BLACK): 7,
-        (chess.BISHOP, chess.BLACK): 8,
-        (chess.ROOK, chess.BLACK): 9,
-        (chess.QUEEN, chess.BLACK): 10,
-        (chess.KING, chess.BLACK): 11
-    }
-    
-    # Add pieces back to the board
-    for square in chess.SQUARES:
-        piece = new_board.piece_at(square)
-        if piece:
-            rank = 7 - chess.square_rank(square)
-            file = chess.square_file(square)
-            features[piece_idx[(piece.piece_type, piece.color)], rank, file] = 1.0
-    
-    # Update current turn (planes 12-13)
-    features[12:14, :, :] = 0.0
-    if new_board.turn == chess.WHITE:
-        features[12].fill_(1.0)
-    else:
-        features[13].fill_(1.0)
-    
-    # Update castling rights (planes 14-17)
-    features[14:18, :, :] = 0.0
-    if new_board.has_kingside_castling_rights(chess.WHITE):
-        features[14].fill_(1.0)
-    if new_board.has_queenside_castling_rights(chess.WHITE):
-        features[15].fill_(1.0)
-    if new_board.has_kingside_castling_rights(chess.BLACK):
-        features[16].fill_(1.0)
-    if new_board.has_queenside_castling_rights(chess.BLACK):
-        features[17].fill_(1.0)
-    
-    # Update en passant square (plane 18)
-    features[18, :, :] = 0.0
-    if new_board.ep_square:
-        rank = 7 - chess.square_rank(new_board.ep_square)
-        file = chess.square_file(new_board.ep_square)
-        features[18, rank, file] = 1.0
-    
-    # Update attack maps (planes 19-20)
-    features[19:21, :, :] = 0.0
-    white_attacks = set()
-    black_attacks = set()
-    
-    for square in chess.SQUARES:
-        piece = new_board.piece_at(square)
-        if not piece:
-            continue
+        # Channel 14-15: Castling rights
+        if board.has_kingside_castling_rights(chess.WHITE):
+            features[14][7][4:7] = 1.0  # White kingside
+        if board.has_queenside_castling_rights(chess.WHITE):
+            features[14][7][0:5] = 1.0  # White queenside
+        if board.has_kingside_castling_rights(chess.BLACK):
+            features[15][0][4:7] = 1.0  # Black kingside
+        if board.has_queenside_castling_rights(chess.BLACK):
+            features[15][0][0:5] = 1.0  # Black queenside
             
-        # Get attacks from this piece
-        attacks = new_board.attacks(square)
-        for attack_square in attacks:
-            if piece.color == chess.WHITE:
-                white_attacks.add(attack_square)
+        # Channel 16-17: En passant
+        if board.ep_square:
+            rank, file = divmod(board.ep_square, 8)
+            features[16][7-rank][file] = 1.0
+            
+            # Mark the pawn that can be captured
+            if board.turn == chess.WHITE:
+                # Black pawn is above the en passant square
+                if rank > 0:  # Ensure we don't go out of bounds
+                    features[17][7-(rank-1)][file] = 1.0
             else:
-                black_attacks.add(attack_square)
-    
-    # Fill attack maps
-    for square in white_attacks:
-        rank = 7 - chess.square_rank(square)
-        file = chess.square_file(square)
-        features[19, rank, file] = 1.0
+                # White pawn is below the en passant square
+                if rank < 7:  # Ensure we don't go out of bounds
+                    features[17][7-(rank+1)][file] = 1.0
         
-    for square in black_attacks:
-        rank = 7 - chess.square_rank(square)
-        file = chess.square_file(square)
-        features[20, rank, file] = 1.0
-    
-    # Update mobility maps (planes 21-22)
-    features[21:23, :, :] = 0.0
-    if new_board.turn == chess.WHITE:
-        for move in new_board.legal_moves:
-            to_rank = 7 - chess.square_rank(move.to_square)
-            to_file = chess.square_file(move.to_square)
-            features[21, to_rank, to_file] = 1.0
-    else:
-        for move in new_board.legal_moves:
-            to_rank = 7 - chess.square_rank(move.to_square)
-            to_file = chess.square_file(move.to_square)
-            features[22, to_rank, to_file] = 1.0
-    
-    # Update move count plane (plane 23)
-    move_count = len(new_board.move_stack)
-    normalized_move_count = min(1.0, move_count / 100.0)
-    features[23].fill_(normalized_move_count)
-    
-    return features
+        # Channels 18-19: Mobility maps (number of legal moves for each piece)
+        for square in chess.SQUARES:
+            piece = board.piece_at(square)
+            if piece:
+                rank, file = divmod(square, 8)
+                channel = 18 if piece.color == chess.WHITE else 19
+                
+                # Count legal moves for this piece
+                count = 0
+                for move in board.legal_moves:
+                    if move.from_square == square:
+                        count += 1
+                
+                # Normalize by maximum possible moves (27 for queen)
+                features[channel][7-rank][file] = min(1.0, count / 27.0)
+        
+        # Channels 20-21: Pawn structure (pawn chains and isolated pawns)
+        for color in [chess.WHITE, chess.BLACK]:
+            channel = 20 if color == chess.WHITE else 21
+            
+            # Get all pawns of this color
+            pawns = board.pieces(chess.PAWN, color)
+            
+            # Mark pawn chains
+            for square in pawns:
+                rank, file = divmod(square, 8)
+                
+                # Check if this pawn is supported by another pawn
+                supported = False
+                if color == chess.WHITE:
+                    # Check if supported by white pawns on the previous rank
+                    if file > 0 and square - 9 in pawns:  # Supported from left
+                        supported = True
+                    if file < 7 and square - 7 in pawns:  # Supported from right
+                        supported = True
+                else:
+                    # Check if supported by black pawns on the previous rank
+                    if file > 0 and square + 7 in pawns:  # Supported from left
+                        supported = True
+                    if file < 7 and square + 9 in pawns:  # Supported from right
+                        supported = True
+                
+                # Mark supported pawns with 1.0, isolated with 0.5
+                if supported:
+                    features[channel][7-rank][file] = 1.0
+                else:
+                    # Check if isolated (no pawns on adjacent files)
+                    isolated = True
+                    for r in range(8):
+                        # Check left file
+                        if file > 0:
+                            left_square = r * 8 + (file - 1)
+                            if left_square in pawns:
+                                isolated = False
+                                break
+                        # Check right file
+                        if file < 7:
+                            right_square = r * 8 + (file + 1)
+                            if right_square in pawns:
+                                isolated = False
+                                break
+                    
+                    if isolated:
+                        features[channel][7-rank][file] = 0.5
+                    else:
+                        features[channel][7-rank][file] = 0.8  # Connected but not supported
+        
+        # Channels 22-23: Attack and defense maps
+        attack_map = torch.zeros(BOARD_SIZE, BOARD_SIZE)
+        defense_map = torch.zeros(BOARD_SIZE, BOARD_SIZE)
+        
+        # For each square, count how many pieces attack/defend it
+        for square in chess.SQUARES:
+            attackers_w = board.attackers(chess.WHITE, square)
+            attackers_b = board.attackers(chess.BLACK, square)
+            
+            rank, file = divmod(square, 8)
+            
+            # Count attackers and defenders
+            if board.turn == chess.WHITE:
+                # For white's turn, white pieces are defenders, black are attackers
+                attack_count = len(attackers_b)
+                defense_count = len(attackers_w)
+            else:
+                # For black's turn, black pieces are defenders, white are attackers
+                attack_count = len(attackers_w)
+                defense_count = len(attackers_b)
+            
+            # Normalize by max reasonable value (5)
+            attack_map[7-rank][file] = min(1.0, attack_count / 5.0)
+            defense_map[7-rank][file] = min(1.0, defense_count / 5.0)
+        
+        # Add attack and defense maps to features
+        features[22] = attack_map
+        features[23] = defense_map
+        
+        # Now that we've built the features tensor, make a copy that requires gradients
+        features_with_grad = features.clone().requires_grad_(True)
+        return features_with_grad
+    except Exception as e:
+        print(f"Error in board_to_features: {e}")
+        # Return a default tensor with the correct shape
+        return torch.zeros(INPUT_CHANNELS, BOARD_SIZE, BOARD_SIZE, requires_grad=True)
 
 def get_feature_diff(board, move):
     """
-    Calculate which features to add and remove when a move is made.
-    This identifies the specific changes to the board state for incremental updates.
+    Calculate the difference in features after a move (for efficient updates).
     
     Args:
-        board: Chess board before the move
-        move: The move to be made
+        board: Chess board position
+        move: Move to apply
         
     Returns:
-        Dictionary with info about what features need to change
+        Tuple of (removed_features, added_features) for incremental updates
     """
-    # Create dictionary to track changes
-    changes = {
-        'from_square': move.from_square,
-        'to_square': move.to_square,
-        'piece_moved': board.piece_at(move.from_square),
-        'piece_captured': board.piece_at(move.to_square),
-        'promotion': move.promotion,
-        'is_castling': board.is_castling(move),
-        'is_en_passant': board.is_en_passant(move)
-    }
+    # Create copies of the board before and after the move
+    board_before = board.copy()
+    board_after = board.copy()
+    board_after.push(move)
     
-    return changes
+    # Get features for both boards
+    features_before = board_to_features(board_before)
+    features_after = board_to_features(board_after)
+    
+    # Calculate differences
+    removed_features = (features_before > 0) & (features_after == 0)
+    added_features = (features_before == 0) & (features_after > 0)
+    
+    return removed_features, added_features
+
+def get_piece_value(piece_type):
+    """Get the value of a piece type in centipawns."""
+    values = {
+        chess.PAWN: 100,
+        chess.KNIGHT: 320,
+        chess.BISHOP: 330,
+        chess.ROOK: 500,
+        chess.QUEEN: 900,
+        chess.KING: 20000
+    }
+    return values.get(piece_type, 0)

@@ -5,3 +5,7 @@ saved_models/pearlXL.pt filter=lfs diff=lfs merge=lfs -text
 saved_models/standard.pt filter=lfs diff=lfs merge=lfs -text
  filter=lfs diff=lfs merge=lfs -text
 saved_models/* filter=lfs diff=lfs merge=lfs -text
+saved_models/nnue_weights_20250311_164508_training.png filter=lfs diff=lfs merge=lfs -text
+saved_models/nnue_weights_20250311_164508.pt filter=lfs diff=lfs merge=lfs -text
+saved_models/nnue_weights_20250311_164635_training.png filter=lfs diff=lfs merge=lfs -text
+saved_models/nnue_weights_20250311_164635.pt filter=lfs diff=lfs merge=lfs -text

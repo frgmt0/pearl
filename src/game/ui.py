@@ -19,36 +19,21 @@ class ChessUI:
     """
     Text-based user interface for the chess engine.
     """
-    def __init__(self, use_unicode=True, use_color=True, use_enhanced_model=True, use_xl_model=False):
+    def __init__(self, use_unicode=True, use_color=True):
         """
         Initialize the chess UI.
         
         Args:
             use_unicode: Use Unicode characters for board display
             use_color: Use color for board display
-            use_enhanced_model: Whether to use the enhanced model architecture (backward compatibility)
-            use_xl_model: Whether to use the XL model architecture (backward compatibility)
         """
         self.term = Terminal()
         self.board = ChessBoard()
         
-        # Convert old parameters to model_type for new system
-        if use_enhanced_model and use_xl_model:
-            model_type = "pearlxl"
-            model_name = "PearlXL"
-        elif use_enhanced_model:
-            model_type = "pearl"
-            model_name = "Pearl"
-        else:
-            model_type = "standard"
-            model_name = "Standard"
-            
-        print(f"Loading {model_name} model...")
+        print("Loading Pearl Chess Engine (16M parameters)...")
         
-        # Initialize the engine with the selected model type
-        self.engine = NNUEEngine(
-            model_type=model_type
-        )
+        # Initialize the engine with the default model
+        self.engine = NNUEEngine()
         
         # Try to initialize Stockfish API, fall back to mock if unavailable
         try:
@@ -858,15 +843,11 @@ class ChessUI:
                             print(self.term.yellow("🧠 Using position memory and curriculum learning"))
                             
                             # Run finetuning with all our enhancements
-                            # Get model type from the engine
-                            model_type = getattr(self.engine, 'model_type', 'standard')
-                            
                             finetune_from_pgn(
                                 pgn_path, 
                                 epochs=50, 
                                 batch_size=32, 
                                 feedback=feedback,
-                                model_type=model_type,
                                 use_memory=True
                             )
                             print(self.term.green("✅ Finetuning complete! Model has been updated to base.pt"))
@@ -954,98 +935,10 @@ class ChessUI:
             self.clear_screen()
             self.main_menu()
 
-def select_model():
-    """
-    Display a model selection menu and return the selected model parameters.
-    
-    Returns:
-        Tuple of (use_enhanced, use_xl)
-    """
-    from blessed import Terminal
-    from colorama import Fore, Style
-    
-    term = Terminal()
-    print(term.clear())
-    
-    print(Fore.CYAN + "=" * term.width + Style.RESET_ALL)
-    print(Fore.CYAN + "Pearl Chess Engine - Select Neural Network Model".center(term.width) + Style.RESET_ALL)
-    print(Fore.CYAN + "=" * term.width + Style.RESET_ALL)
-    
-    print("\nAvailable models:")
-    print(Fore.GREEN + "1. " + Style.BRIGHT + "Standard Model" + Style.RESET_ALL + 
-          " (260K parameters, fastest, least powerful)")
-    print(Fore.YELLOW + "2. " + Style.BRIGHT + "Pearl Model" + Style.RESET_ALL + 
-          " (8M parameters, balanced, enhanced evaluation)")
-    print(Fore.MAGENTA + "3. " + Style.BRIGHT + "PearlXL Model" + Style.RESET_ALL + 
-          " (16M parameters, slowest, most powerful)")
-    
-    # Import model utilities
-    from src.engine.nnue.model_handler import initialize_default_models, list_available_models
-    
-    # Initialize default models if they don't exist
-    initialize_default_models()
-    
-    # Check which models are available
-    models = list_available_models()
-    
-    # Display model status
-    print("\nModel status:")
-    
-    if models["pearl"]:
-        print(Fore.GREEN + "✓ " + Style.RESET_ALL + f"Pearl model found ({os.path.basename(models['pearl'][0])})")
-    else:
-        print(Fore.YELLOW + "⚠ " + Style.RESET_ALL + "Pearl model will be created if selected")
-    
-    if models["pearlxl"]:
-        print(Fore.GREEN + "✓ " + Style.RESET_ALL + f"PearlXL model found ({os.path.basename(models['pearlxl'][0])})")
-    else:
-        print(Fore.YELLOW + "⚠ " + Style.RESET_ALL + "PearlXL model will be created if selected")
-    
-    if models["standard"]:
-        print(Fore.GREEN + "✓ " + Style.RESET_ALL + f"Standard model found ({os.path.basename(models['standard'][0])})")
-    else:
-        print(Fore.YELLOW + "⚠ " + Style.RESET_ALL + "Standard model will be created if selected")
-    
-    print("\nNote: Larger models provide better chess evaluation but require more time")
-    print("for moves and training. First-time creation of a model may take a moment.")
-    
-    # Get user choice
-    choice = None
-    while choice not in ["1", "2", "3"]:
-        choice = input("\nSelect model (1-3, default=2): ")
-        if choice == "":
-            choice = "2"  # Default to Pearl model
-    
-    # Convert choice to model type
-    if choice == "1":
-        # Standard model
-        model_type = "standard"
-        print(Fore.GREEN + "\nSelected: Standard Model" + Style.RESET_ALL)
-    elif choice == "2":
-        # Pearl model
-        model_type = "pearl"
-        print(Fore.YELLOW + "\nSelected: Pearl Model" + Style.RESET_ALL)
-    else:
-        # PearlXL model
-        model_type = "pearlxl"
-        print(Fore.MAGENTA + "\nSelected: PearlXL Model" + Style.RESET_ALL)
-    
-    # Wait for user confirmation
-    print("\nInitializing model, please wait...")
-    
-    # For backward compatibility (return tuple format)
-    use_enhanced = model_type != "standard"
-    use_xl = model_type == "pearlxl"
-    
-    return use_enhanced, use_xl
-
 def main():
     """Main entry point for the chess UI."""
-    # First show the model selection menu
-    use_enhanced, use_xl = select_model()
-    
-    # Create UI with the selected model type
-    ui = ChessUI(use_enhanced_model=use_enhanced, use_xl_model=use_xl)
+    # Create UI with the default model
+    ui = ChessUI()
     ui.run()
 
 if __name__ == "__main__":
