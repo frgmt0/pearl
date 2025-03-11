@@ -7,8 +7,9 @@ import threading
 import concurrent.futures
 import multiprocessing
 
-from src.engine.score import evaluate_position
+from src.engine.score import evaluate_position, classical_evaluate
 from src.engine.movePick import pick_move
+from src.engine.memory import TranspositionTable
 
 # Constants for search
 INFINITY = 30000
@@ -38,65 +39,64 @@ class SearchInfo:
         self.history_heuristic = defaultdict(int)
         # Initialize with MAX_PLY instead of MAX_DEPTH for deeper searches
         self.killer_moves = [[None for _ in range(2)] for _ in range(MAX_PLY + 1)]
-        self.transposition_table = {}
+        
+        # Use the TranspositionTable class instead of a simple dictionary
+        self.transposition_table = TranspositionTable(max_size_mb=128)  # 128MB table
+        self.tt_age = 0  # Age counter for the transposition table
         
         # Thread synchronization locks
         self.nodes_lock = threading.Lock()
         self.best_move_lock = threading.Lock()
-        self.transposition_table_lock = threading.Lock()
         self.history_lock = threading.Lock()
-        
-    def should_stop(self):
-        """Check if search should be stopped due to time constraints."""
-        # Always stop if manually requested
-        if self.stop_search:
-            return True
-            
-        # Check elapsed time against time limit
-        elapsed = self.get_elapsed_time()
-        
-        # Hard safety cap: Stop after 60 seconds no matter what
-        ABSOLUTE_MAX_TIME = 60000  # 60 seconds in ms
-        if elapsed >= ABSOLUTE_MAX_TIME:
-            print(f"⚠️ SAFETY: Stopping search after reaching absolute max time ({ABSOLUTE_MAX_TIME/1000}s)")
-            return True
-            
-        # Normal time limit check
-        if self.time_limit_ms > 0:
-            return elapsed >= self.time_limit_ms
-            
-        return False
-        
-    def get_elapsed_time(self):
-        """Get elapsed time in milliseconds."""
-        return int((time.time() - self.start_time) * 1000)
-        
-    def update_best_move(self, move, score, depth, pv):
-        """Update the best move found so far (thread-safe)."""
-        with self.best_move_lock:
-            self.best_move = move
-            self.best_score = score
-            self.depth = depth
-            self.pv_line = pv.copy() if pv else []
-        
+    
     def increment_nodes(self):
-        """Increment node counter in a thread-safe way."""
+        """Increment the nodes searched counter (thread-safe)."""
         with self.nodes_lock:
             self.nodes_searched += 1
+    
+    def get_elapsed_time(self):
+        """Get the elapsed time in milliseconds."""
+        return int((time.time() - self.start_time) * 1000)
+    
+    def should_stop(self):
+        """Check if the search should stop."""
+        # Check if stop flag is set
+        if self.stop_search:
+            return True
         
+        # Check if time limit is reached
+        if self.time_limit_ms > 0 and self.get_elapsed_time() >= self.time_limit_ms:
+            self.stop_search = True
+            return True
+        
+        return False
+    
+    def update_best_move(self, move, score, depth, pv_line):
+        """Update the best move found (thread-safe)."""
+        with self.best_move_lock:
+            # Only update if this is a deeper search or a better score
+            if depth > self.depth or (depth == self.depth and score > self.best_score):
+                self.best_move = move
+                self.best_score = score
+                self.depth = depth
+                self.pv_line = pv_line
+    
     def update_killer_move(self, move, ply):
         """
-        Update killer moves for the given ply.
+        Update killer moves (thread-safe).
         Killer moves are quiet moves that cause beta cutoffs.
         """
-        # Safety check for ply index to prevent out-of-range errors
-        if ply >= len(self.killer_moves):
+        # Ensure ply is within bounds
+        if ply >= MAX_PLY:
             return
             
-        # Killer moves are ply-specific, so no need for locks
-        if self.killer_moves[ply][0] != move:
-            self.killer_moves[ply][1] = self.killer_moves[ply][0]
-            self.killer_moves[ply][0] = move
+        # Don't add the same move twice
+        if self.killer_moves[ply][0] == move:
+            return
+            
+        # Shift killer moves and add the new one
+        self.killer_moves[ply][1] = self.killer_moves[ply][0]
+        self.killer_moves[ply][0] = move
             
     def update_history_score(self, move, depth):
         """
@@ -125,13 +125,7 @@ class SearchInfo:
         key = hash(board.fen())
         
         # Store position information (thread-safe)
-        with self.transposition_table_lock:
-            self.transposition_table[key] = {
-                'depth': depth,
-                'score': score,
-                'flag': flag,
-                'move': move
-            }
+        self.transposition_table.store(key, depth, score, move, flag, self.tt_age)
         
     def probe_hash(self, board, depth, alpha, beta):
         """
@@ -152,8 +146,7 @@ class SearchInfo:
         key = hash(board.fen())
         
         # Thread-safe read from transposition table
-        with self.transposition_table_lock:
-            entry = self.transposition_table.get(key)
+        entry = self.transposition_table.probe(key)
         
         if entry is None:
             return False, 0, None
@@ -175,6 +168,41 @@ class SearchInfo:
             
         # Return the move for move ordering but don't use the score
         return False, 0, entry['move']
+
+def is_futile_move(board, move, margin=100):
+    """
+    Check if a move is likely futile and can be pruned.
+    
+    Args:
+        board: Chess board position
+        move: Move to check
+        margin: Margin in centipawns to determine futility
+        
+    Returns:
+        True if the move is likely futile, False otherwise
+    """
+    # Don't prune captures, promotions, or checks
+    if board.is_capture(move) or move.promotion:
+        return False
+        
+    # Check if the move gives check
+    board.push(move)
+    gives_check = board.is_check()
+    board.pop()
+    
+    if gives_check:
+        return False
+    
+    # Get static evaluation
+    static_eval = classical_evaluate(board)
+    
+    # If we're already doing well, the move might be futile
+    if board.turn == chess.WHITE and static_eval > margin:
+        return True
+    elif board.turn == chess.BLACK and static_eval < -margin:
+        return True
+    
+    return False
 
 def alpha_beta(board, depth, alpha, beta, info, ply=0, null_move_allowed=True):
     """
@@ -228,56 +256,122 @@ def alpha_beta(board, depth, alpha, beta, info, ply=0, null_move_allowed=True):
             # Stalemate or other draw
             return DRAW_SCORE
     
-    # Null Move Pruning
-    # If we're not in check and have sufficient material, try a null move
-    if (null_move_allowed and depth >= 3 and not board.is_check() and
-        has_non_pawn_material(board, board.turn)):
-        
-        # Make a "null move" (pass the turn)
+    # Store original alpha for transposition table
+    alpha_orig = alpha
+    
+    # Null move pruning
+    # Skip null move pruning if:
+    # 1. We're in check
+    # 2. We're at a low depth
+    # 3. Null move pruning is disabled for this call
+    if (
+        null_move_allowed and 
+        depth >= 3 and 
+        not board.is_check() and
+        has_non_pawn_material(board, board.turn)
+    ):
+        # Make a null move (skip a turn)
         board.push(chess.Move.null())
         
-        # Search with reduced depth
-        null_reduction = 3  # R value in standard null-move pruning
-        null_score = -alpha_beta(board, depth - 1 - null_reduction, -beta, -beta + 1, 
-                                info, ply + 1, False)
+        # Search with reduced depth (R=2)
+        null_score = -alpha_beta(
+            board, depth - 3, -beta, -beta + 1, info, ply + 1, False
+        )
         
-        # Unmake the null move
         board.pop()
         
-        # If the score exceeds beta, prune this subtree
+        # Check if search should stop
         if info.should_stop():
             return 0
-            
+        
+        # If the score is good enough, we can prune this branch
         if null_score >= beta:
             return beta
     
-    # Generate moves
-    moves = list(board.legal_moves)
+    # Internal iterative deepening
+    # If we don't have a hash move and we're at a reasonable depth
+    if hash_move is None and depth >= 4:
+        # Do a shallow search to find a good move
+        iid_score = alpha_beta(board, depth - 2, alpha, beta, info, ply, False)
+        
+        # Check if search should stop
+        if info.should_stop():
+            return 0
+            
+        # Get the best move from the shallow search
+        hash_hit, hash_score, hash_move = info.probe_hash(board, depth - 2, alpha, beta)
     
-    # If no legal moves, return score
-    if not moves:
+    # Get legal moves
+    legal_moves = list(board.legal_moves)
+    
+    # If there are no legal moves, it's checkmate or stalemate
+    if not legal_moves:
         if board.is_check():
-            # Checkmate
             return -MATE_SCORE + ply
         else:
-            # Stalemate
             return DRAW_SCORE
     
-    # Move ordering using history and killer heuristics
-    ordered_moves = pick_move(board, moves, info, hash_move, ply)
+    # Order moves to improve pruning
+    ordered_moves = pick_move(board, legal_moves, info, hash_move, ply)
     
-    best_move = None
+    # Initialize best score and move
     best_score = -INFINITY
-    alpha_orig = alpha
+    best_move = None
+    
+    # Count of moves searched
+    moves_searched = 0
     
     # Try each move
     for move in ordered_moves:
+        # Futility pruning - skip moves that are likely futile
+        if depth <= 2 and not board.is_check() and moves_searched > 0:
+            if is_futile_move(board, move, margin=100 * depth):
+                continue
+        
         board.push(move)
         
-        # Search with this move
-        score = -alpha_beta(board, depth - 1, -beta, -alpha, info, ply + 1)
+        # Late move reduction
+        # If we've searched several moves and this is a quiet move at a good depth
+        if (
+            depth >= 3 and 
+            moves_searched >= 3 and 
+            not board.is_check() and 
+            not board.is_capture(move) and 
+            move.promotion is None
+        ):
+            # Search with reduced depth
+            score = -alpha_beta(
+                board, depth - 2, -alpha - 1, -alpha, info, ply + 1
+            )
+            
+            # If the score is good but not too good, do a full search
+            if score > alpha and score < beta:
+                score = -alpha_beta(
+                    board, depth - 1, -beta, -alpha, info, ply + 1
+                )
+        else:
+            # Principal variation search
+            if moves_searched > 0:
+                # Search with a null window to see if this move is better than our best so far
+                score = -alpha_beta(
+                    board, depth - 1, -alpha - 1, -alpha, info, ply + 1
+                )
+                
+                # If the score is good but not too good, do a full search
+                if score > alpha and score < beta:
+                    score = -alpha_beta(
+                        board, depth - 1, -beta, -alpha, info, ply + 1
+                    )
+            else:
+                # Full search for the first move
+                score = -alpha_beta(
+                    board, depth - 1, -beta, -alpha, info, ply + 1
+                )
         
         board.pop()
+        
+        # Increment moves searched
+        moves_searched += 1
         
         # Check if search should stop
         if info.should_stop():
@@ -318,10 +412,16 @@ def alpha_beta(board, depth, alpha, beta, info, ply=0, null_move_allowed=True):
     
     return best_score
 
-def quiescence_search(board, alpha, beta, info, ply, depth_left):
+def has_non_pawn_material(board, color):
+    """Check if a side has any non-pawn material."""
+    for piece_type in [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]:
+        if len(board.pieces(piece_type, color)) > 0:
+            return True
+    return False
+
+def quiescence_search(board, alpha, beta, info, ply=0, depth_left=QUIESCENCE_DEPTH):
     """
-    Quiescence search to handle tactical positions.
-    Only considers captures to reach a "quiet" position.
+    Quiescence search to resolve tactical sequences.
     
     Args:
         board: Chess board position
@@ -329,57 +429,45 @@ def quiescence_search(board, alpha, beta, info, ply, depth_left):
         beta: Beta bound
         info: SearchInfo object
         ply: Current ply from root
-        depth_left: Maximum quiescence depth left
+        depth_left: Maximum depth left for quiescence search
         
     Returns:
         Score for the position
     """
     # Safety check for maximum recursion depth
-    if ply >= MAX_PLY:
+    if ply >= MAX_PLY or depth_left <= 0:
         return evaluate_position(board)
-    
+        
+    # Check if we should stop the search
+    if info.should_stop():
+        return 0
+        
     # Update node count (thread-safe)
     info.increment_nodes()
     
-    # Check if we should stop
-    if info.should_stop():
-        return 0
-    
-    # Stand-pat score (static evaluation)
+    # Stand pat - evaluate the current position
     stand_pat = evaluate_position(board)
     
     # Beta cutoff
     if stand_pat >= beta:
         return beta
-    
-    # Update alpha
+        
+    # Update alpha if stand pat is better
     if stand_pat > alpha:
         alpha = stand_pat
     
-    # If we've reached the maximum quiescence depth, return the stand-pat score
-    if depth_left <= 0:
-        return stand_pat
+    # Get only captures and promotions
+    captures = [move for move in board.legal_moves if board.is_capture(move) or move.promotion]
     
-    # Generate capture moves
-    captures = [move for move in board.legal_moves if board.is_capture(move)]
-    
-    # If no captures, return stand-pat score
-    if not captures:
-        return stand_pat
-    
-    # Sort captures by MVV-LVA (Most Valuable Victim - Least Valuable Aggressor)
-    captures = sort_mvv_lva(board, captures)
+    # Order captures by MVV-LVA
+    ordered_captures = pick_move(board, captures, info)
     
     # Try each capture
-    for move in captures:
+    for move in ordered_captures:
         board.push(move)
         
-        # Only consider positions where we're not in check
-        # This helps filter out some bad captures
-        if not board.is_check():
-            score = -quiescence_search(board, -beta, -alpha, info, ply + 1, depth_left - 1)
-        else:
-            score = -alpha_beta(board, 1, -beta, -alpha, info, ply + 1)
+        # Recursive quiescence search
+        score = -quiescence_search(board, -beta, -alpha, info, ply + 1, depth_left - 1)
         
         board.pop()
         
@@ -387,191 +475,15 @@ def quiescence_search(board, alpha, beta, info, ply, depth_left):
         if info.should_stop():
             return 0
         
-        # Update alpha
+        # Update alpha if this move is better
         if score > alpha:
             alpha = score
-        
+            
         # Beta cutoff
         if score >= beta:
             return beta
     
     return alpha
-
-def sort_mvv_lva(board, moves):
-    """
-    Sort moves by Most Valuable Victim - Least Valuable Aggressor.
-    
-    Args:
-        board: Chess board
-        moves: List of moves to sort
-        
-    Returns:
-        Sorted list of moves
-    """
-    move_scores = []
-    
-    # Piece values (pawn=1, knight=3, bishop=3, rook=5, queen=9)
-    piece_values = {
-        chess.PAWN: 1, 
-        chess.KNIGHT: 3, 
-        chess.BISHOP: 3, 
-        chess.ROOK: 5, 
-        chess.QUEEN: 9, 
-        chess.KING: 20
-    }
-    
-    for move in moves:
-        # Get the captured piece value (victim)
-        victim_square = move.to_square
-        victim = board.piece_at(victim_square)
-        victim_value = piece_values.get(victim.piece_type, 0) if victim else 0
-        
-        # Get the moving piece value (aggressor)
-        aggressor_square = move.from_square
-        aggressor = board.piece_at(aggressor_square)
-        aggressor_value = piece_values.get(aggressor.piece_type, 0) if aggressor else 0
-        
-        # MVV-LVA score: 10 * victim value - aggressor value
-        # This prioritizes capturing high-value pieces with low-value pieces
-        score = 10 * victim_value - aggressor_value
-        
-        move_scores.append((move, score))
-    
-    # Sort by score (descending)
-    move_scores.sort(key=lambda x: x[1], reverse=True)
-    
-    # Return sorted moves
-    return [move for move, _ in move_scores]
-
-def has_non_pawn_material(board, color):
-    """
-    Check if a side has non-pawn material (for null move pruning).
-    
-    Args:
-        board: Chess board
-        color: Color to check (True for white, False for black)
-        
-    Returns:
-        True if the side has non-pawn material (knight, bishop, rook, queen)
-    """
-    for piece_type in [chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN]:
-        if board.pieces(piece_type, color):
-            return True
-    return False
-
-def simple_parallel_search(board, depth, info):
-    """
-    Simplified parallel search at the root level with safety limits.
-    
-    Args:
-        board: Chess board position
-        depth: Current search depth
-        info: SearchInfo object
-        
-    Returns:
-        Best score found
-    """
-    # Generate legal moves at root
-    legal_moves = list(board.legal_moves)
-    
-    # If no legal moves, return appropriate score
-    if not legal_moves:
-        if board.is_check():
-            return -MATE_SCORE  # Checkmate
-        else:
-            return DRAW_SCORE   # Stalemate
-    
-    # Use move ordering to prioritize promising moves
-    ordered_moves = pick_move(board, legal_moves, info, None, 0)
-    
-    # Initialize search variables
-    best_score = -INFINITY
-    best_move = None
-    alpha = -INFINITY
-    beta = INFINITY
-    
-    # Safety: Maximum time per move at any depth (3 seconds for depth 3, 6 for depth 4, etc.)
-    # This prevents any single move evaluation from hanging
-    MAX_MOVE_TIME_MS = 2000 * depth 
-    
-    # Log the start of parallel search
-    print(f"Starting simplified parallel search at depth {depth} with {len(ordered_moves)} moves")
-    
-    # Get number of CPU cores (limit to 4 max to avoid overhead)
-    num_workers = min(4, max(1, multiprocessing.cpu_count() - 1))
-
-    # Create a thread pool with a timeout
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # Store futures in a dictionary
-        future_results = {}
-        
-        # Launch a search for each move
-        for move in ordered_moves:
-            # Skip if we should stop
-            if info.should_stop():
-                break
-                
-            # Create a board copy for this move
-            board_copy = board.copy()
-            board_copy.push(move)
-            
-            # Submit the search task with a timeout
-            def search_task():
-                try:
-                    # Use a negated search for opponent's perspective
-                    return -alpha_beta(board_copy, depth - 1, -beta, -alpha, info, 1)
-                except Exception as e:
-                    print(f"Search error for move {move}: {e}")
-                    return -INFINITY
-            
-            # Submit the task
-            future = executor.submit(search_task)
-            future_results[move] = future
-        
-        # Process completed searches
-        completed_moves = 0
-        for move, future in future_results.items():
-            # Skip if we should stop
-            if info.should_stop():
-                break
-                
-            try:
-                # Wait for the result with a timeout
-                score = future.result(timeout=MAX_MOVE_TIME_MS/1000)
-                completed_moves += 1
-                
-                # Update best move if better
-                if score > best_score:
-                    best_score = score
-                    best_move = move
-                    
-                    # Create a simple PV line
-                    pv_line = [move]
-                    
-                    # Update the best move
-                    info.update_best_move(move, score, depth, pv_line)
-                    
-                    # Update alpha for pruning
-                    if score > alpha:
-                        alpha = score
-                
-                # Log progress
-                if completed_moves % 5 == 0 or completed_moves == len(ordered_moves):
-                    print(f"Completed {completed_moves}/{len(ordered_moves)} moves at depth {depth}")
-                    
-            except concurrent.futures.TimeoutError:
-                # Log timeout and skip this move
-                print(f"Move {move} timed out after {MAX_MOVE_TIME_MS/1000}s at depth {depth}")
-                continue
-            except Exception as e:
-                # Log any other errors
-                print(f"Error evaluating move {move}: {e}")
-                continue
-    
-    # Log completion
-    print(f"Parallel search completed at depth {depth}. Best move: {best_move}, score: {best_score}")
-    
-    return best_score
 
 def iterative_deepening_search(board, info):
     """
@@ -588,12 +500,34 @@ def iterative_deepening_search(board, info):
     info.nodes_searched = 0
     info.stop_search = False
     
+    # Increment the transposition table age
+    info.tt_age += 1
+    
+    # Calculate maximum time for search (with a buffer)
+    max_time_ms = info.time_limit_ms
+    if max_time_ms > 0:
+        # Use 95% of the time limit to ensure we don't exceed it
+        max_time_ms = int(max_time_ms * 0.95)
+    
     # Start with depth 1 and increase
     for depth in range(1, MAX_DEPTH + 1):
         info.depth = depth
         
         # Reset PV line for this iteration
         info.pv_line = []
+        
+        # Calculate time spent so far
+        elapsed_ms = info.get_elapsed_time()
+        
+        # Check if we have enough time for the next iteration
+        if max_time_ms > 0:
+            # Estimate time for next iteration based on current depth
+            # Each depth typically takes 3-5x longer than the previous
+            estimated_next_ms = elapsed_ms * 4
+            
+            # If we don't have enough time, stop the search
+            if elapsed_ms + estimated_next_ms > max_time_ms:
+                break
         
         # For depth 1-3, use standard alpha-beta (more reliable)
         if depth <= 3:
@@ -615,22 +549,100 @@ def iterative_deepening_search(board, info):
     
     return info.best_move, info.best_score, info.depth
 
-def get_best_move(board, time_limit_ms=60000):
+def simple_parallel_search(board, depth, info):
     """
-    Get the best move for a position using iterative deepening with parallel search.
+    Simple parallel search at the root level.
     
     Args:
         board: Chess board position
-        time_limit_ms: Time limit in milliseconds (default: 60000 = 1 minute)
+        depth: Search depth
+        info: SearchInfo object
         
     Returns:
-        Best move found within the time limit
+        Best score found
     """
-    # Initialize search info
+    # Get legal moves
+    legal_moves = list(board.legal_moves)
+    
+    # If there's only one legal move, return it immediately
+    if len(legal_moves) == 1:
+        info.best_move = legal_moves[0]
+        info.best_score = 0  # Neutral score
+        return 0
+    
+    # Order moves to improve pruning
+    hash_hit, hash_score, hash_move = info.probe_hash(board, depth - 1, -INFINITY, INFINITY)
+    ordered_moves = pick_move(board, legal_moves, info, hash_move)
+    
+    # Determine number of threads to use (up to number of CPUs)
+    num_threads = min(len(ordered_moves), multiprocessing.cpu_count())
+    
+    # Use ThreadPoolExecutor for parallel search
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_threads) as executor:
+        # Submit search tasks for each move
+        futures = []
+        for move in ordered_moves:
+            futures.append(executor.submit(
+                search_move, board.copy(), move, depth, info
+            ))
+        
+        # Wait for all tasks to complete
+        concurrent.futures.wait(futures)
+    
+    # Return the best score (already updated in info)
+    return info.best_score
+
+def search_move(board, move, depth, info):
+    """
+    Search a single move (used for parallel search).
+    
+    Args:
+        board: Chess board position
+        move: Move to search
+        depth: Search depth
+        info: SearchInfo object
+        
+    Returns:
+        Score for the move
+    """
+    # Make the move
+    board.push(move)
+    
+    # Search with negamax
+    score = -alpha_beta(board, depth - 1, -INFINITY, -info.best_score, info, 1)
+    
+    # Check if search should stop
+    if info.should_stop():
+        return 0
+    
+    # Update best move if this is better
+    if score > info.best_score:
+        pv_line = [move] + info.pv_line
+        info.update_best_move(move, score, depth, pv_line)
+    
+    return score
+
+def get_best_move(board, time_limit_ms=1000, depth=None):
+    """
+    Get the best move for a position.
+    
+    Args:
+        board: Chess board position
+        time_limit_ms: Time limit in milliseconds (0 for no limit)
+        depth: Maximum depth to search (None for iterative deepening)
+        
+    Returns:
+        Tuple of (best_move, score, depth)
+    """
+    # Create search info
     info = SearchInfo()
-    info.time_limit_ms = time_limit_ms  # Hard cap at 1 minute
+    info.time_limit_ms = time_limit_ms
     
-    # Perform iterative deepening search
-    best_move, score, depth = iterative_deepening_search(board, info)
+    # If depth is specified, search to that depth
+    if depth is not None:
+        info.depth = depth
+        score = alpha_beta(board, depth, -INFINITY, INFINITY, info)
+        return info.best_move, score, depth
     
-    return best_move
+    # Otherwise, use iterative deepening
+    return iterative_deepening_search(board, info)

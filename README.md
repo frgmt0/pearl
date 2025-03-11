@@ -229,3 +229,113 @@ Once trained, you can play against the engine using the terminal UI:
 ```bash
 python main.py --model ../saved_models/final_model.pt
 ```
+
+# Pearl Chess Engine
+
+Pearl is a chess engine and AI training framework designed to learn from master games and improve through self-play.
+
+## Engine Improvements
+
+The Pearl chess engine has been enhanced with several classical chess engine techniques:
+
+### 1. Attack Maps
+- Added support for attack maps to improve tactical awareness
+- Implemented functions to generate and evaluate attack patterns
+- Enhanced position evaluation by considering piece attacks and threats
+
+### 2. Move Pruning
+- Implemented futility pruning to skip moves unlikely to improve the position
+- Added late move reduction (LMR) to search promising moves more deeply
+- Enhanced move ordering with MVV-LVA (Most Valuable Victim - Least Valuable Aggressor)
+
+### 3. Value Maps
+- Added piece-square tables for different game phases
+- Implemented position-dependent piece evaluation
+- Enhanced evaluation by considering piece placement and coordination
+
+### 4. Iterative Deepening
+- Upgraded iterative deepening to allow for up to 3 minutes of thinking time
+- Implemented time management to ensure efficient use of allocated time
+- Added principal variation search for more efficient tree exploration
+
+### 5. Transposition Tables
+- Added support for efficient transposition tables with aging mechanism
+- Implemented memory-efficient storage with LRU replacement strategy
+- Enhanced search speed by reusing previously evaluated positions
+
+## Installation
+
+1. Clone the repository:
+```bash
+git clone https://github.com/yourusername/pearl.git
+cd pearl
+```
+
+2. Install the required dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+## Usage
+
+### Playing Against the Engine
+
+To play against the Pearl chess engine:
+
+```bash
+python main.py --mode play
+```
+
+### Training the Model
+
+To train the model using the dataset of master games:
+
+```bash
+python main.py --mode train
+```
+
+### Converting PGN to CSV
+
+To convert PGN files to the training dataset format:
+
+```bash
+python src/pgn_to_csv.py
+```
+
+This will process all PGN files in the `dataset/mastergames` directory and append the data to `dataset/dataset.csv`.
+
+### Engine Self-Play
+
+To have the engine play against itself to generate training data:
+
+```bash
+python main.py --mode selfplay --games 100
+```
+
+### Evaluating Positions
+
+To evaluate a specific position:
+
+```bash
+python main.py --mode eval --fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+```
+
+## Project Structure
+
+- `src/engine/`: Core chess engine components
+  - `search.py`: Alpha-beta search with enhancements
+  - `score.py`: Position evaluation functions
+  - `movePick.py`: Move ordering for efficient search
+  - `memory.py`: Transposition table implementation
+- `src/modes/`: Different operation modes
+  - `etrain.py`: Training functionality
+  - `eplay.py`: Interactive play mode
+  - `eselfplay.py`: Self-play for data generation
+- `src/nnue/`: Neural network components
+- `dataset/`: Training data
+  - `mastergames/`: PGN files of master games
+  - `dataset.csv`: Processed training data
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.

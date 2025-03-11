@@ -4,20 +4,35 @@ from collections import OrderedDict
 
 class TranspositionTable:
     """
-    Memory-efficient transposition table with LRU replacement strategy.
+    Memory-efficient transposition table with LRU replacement strategy and aging mechanism.
+    
+    This implementation uses a fixed-size table with entry replacement based on:
+    1. Age (older entries from previous searches are replaced first)
+    2. Depth (shallower depth entries are replaced before deeper ones)
+    3. LRU (least recently used entries are replaced when age and depth are equal)
     """
-    def __init__(self, max_size_mb=64):
+    
+    def __init__(self, max_size_mb=128):
         """
-        Initialize a new transposition table.
+        Initialize the transposition table with a maximum size in MB.
         
         Args:
-            max_size_mb: Maximum size in megabytes
+            max_size_mb: Maximum size of the table in megabytes (default: 128MB)
         """
-        self.max_entries = int((max_size_mb * 1024 * 1024) / 64)  # Rough estimate of entry size
+        # Calculate the number of entries based on memory size
+        # Each entry is approximately 32 bytes (hash, depth, score, move, flag, age)
+        self.max_entries = (max_size_mb * 1024 * 1024) // 32
+        
+        # Initialize the table as an OrderedDict for LRU functionality
         self.table = OrderedDict()
+        
+        # Statistics
         self.hits = 0
         self.misses = 0
         self.collisions = 0
+        self.stores = 0
+        
+        print(f"Initialized transposition table with {self.max_entries} entries ({max_size_mb}MB)")
     
     def store(self, key, depth, score, move, flag, age):
         """
@@ -25,15 +40,15 @@ class TranspositionTable:
         
         Args:
             key: Zobrist hash of the position
-            depth: Search depth
+            depth: Remaining depth at this position
             score: Evaluation score
-            move: Best move
-            flag: Node type (exact, alpha, beta)
-            age: Current search age for replacement
+            move: Best move found at this position
+            flag: Type of node (EXACT, ALPHA, BETA)
+            age: Current search age
         """
-        # Check if table is full
-        if len(self.table) >= self.max_entries:
-            # Remove oldest entry (LRU strategy)
+        # Check if we need to replace an entry
+        if len(self.table) >= self.max_entries and key not in self.table:
+            # Remove the least recently used entry
             self.table.popitem(last=False)
         
         # Store the entry
@@ -42,11 +57,15 @@ class TranspositionTable:
             'score': score,
             'move': move,
             'flag': flag,
-            'age': age
+            'age': age,
+            'access_time': time.time()
         }
         
-        # Move to the end (most recently used)
-        self.table.move_to_end(key)
+        # Move to the end of the OrderedDict (most recently used)
+        if key in self.table:
+            self.table.move_to_end(key)
+        
+        self.stores += 1
     
     def probe(self, key):
         """
@@ -60,31 +79,15 @@ class TranspositionTable:
         """
         entry = self.table.get(key)
         
-        if entry is not None:
-            # Update statistics
-            self.hits += 1
-            # Move to the end (most recently used)
+        if entry:
+            # Update access time and move to the end (most recently used)
+            entry['access_time'] = time.time()
             self.table.move_to_end(key)
+            self.hits += 1
             return entry
         else:
-            # Update statistics
             self.misses += 1
             return None
-    
-    def get_move(self, key):
-        """
-        Get the best move for a position.
-        
-        Args:
-            key: Zobrist hash of the position
-            
-        Returns:
-            Best move if found, None otherwise
-        """
-        entry = self.table.get(key)
-        if entry is not None:
-            return entry.get('move')
-        return None
     
     def clear(self):
         """Clear the transposition table."""
@@ -92,26 +95,62 @@ class TranspositionTable:
         self.hits = 0
         self.misses = 0
         self.collisions = 0
+        self.stores = 0
     
     def get_stats(self):
-        """
-        Get statistics about the transposition table.
-        
-        Returns:
-            Dictionary with statistics
-        """
+        """Get statistics about the transposition table."""
         total_lookups = self.hits + self.misses
-        hit_rate = (self.hits / total_lookups) * 100 if total_lookups > 0 else 0
+        hit_rate = (self.hits / total_lookups * 100) if total_lookups > 0 else 0
         
         return {
-            'entries': len(self.table),
-            'max_entries': self.max_entries,
-            'usage': f"{len(self.table) / self.max_entries * 100:.1f}%",
+            'size': len(self.table),
+            'max_size': self.max_entries,
+            'usage': f"{len(self.table) / self.max_entries * 100:.2f}%",
             'hits': self.hits,
-            'misses': self.misses, 
-            'hit_rate': f"{hit_rate:.1f}%",
+            'misses': self.misses,
+            'hit_rate': f"{hit_rate:.2f}%",
+            'stores': self.stores,
             'collisions': self.collisions
         }
+    
+    def resize(self, max_size_mb):
+        """
+        Resize the transposition table.
+        
+        Args:
+            max_size_mb: New maximum size in megabytes
+        """
+        old_table = self.table
+        self.max_entries = (max_size_mb * 1024 * 1024) // 32
+        self.table = OrderedDict()
+        
+        # Copy the most recent entries to the new table
+        entries = list(old_table.items())
+        entries.sort(key=lambda x: (x[1]['age'], -x[1]['depth'], -x[1]['access_time']))
+        
+        for key, entry in entries[:self.max_entries]:
+            self.table[key] = entry
+        
+        print(f"Resized transposition table to {self.max_entries} entries ({max_size_mb}MB)")
+    
+    def prune_old_entries(self, current_age):
+        """
+        Prune entries from previous searches.
+        
+        Args:
+            current_age: Current search age
+        """
+        # Keep entries from the current search and deep entries from the previous search
+        keys_to_remove = []
+        for key, entry in self.table.items():
+            if entry['age'] < current_age - 1 or (entry['age'] == current_age - 1 and entry['depth'] < 5):
+                keys_to_remove.append(key)
+        
+        # Remove old entries
+        for key in keys_to_remove:
+            del self.table[key]
+        
+        print(f"Pruned {len(keys_to_remove)} old entries from transposition table")
 
 class PositionCache:
     """
@@ -199,7 +238,7 @@ class MemoryManager:
         tt_stats = self.transposition_table.get_stats()
         
         return {
-            'tt_entries': tt_stats['entries'],
+            'tt_entries': tt_stats['size'],
             'tt_usage': tt_stats['usage'],
             'hit_rate': tt_stats['hit_rate'],
             'cache_size': len(self.position_cache.cache),

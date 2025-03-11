@@ -289,6 +289,191 @@ def evaluate_position(board):
         print(f"NNUE evaluation failed: {e}, falling back to classical evaluation")
         return classical_evaluate(board)
 
+def get_attack_map(board, color):
+    """
+    Generate an attack map for a specific color.
+    
+    Args:
+        board: Chess board position
+        color: Color to generate attack map for (chess.WHITE or chess.BLACK)
+        
+    Returns:
+        Dictionary mapping squares to the number of attackers
+    """
+    attack_map = {}
+    
+    # For each piece of the given color
+    for square in chess.SQUARES:
+        piece = board.piece_at(square)
+        if piece and piece.color == color:
+            # Get all squares this piece attacks
+            for attack_square in board.attacks(square):
+                if attack_square not in attack_map:
+                    attack_map[attack_square] = []
+                attack_map[attack_square].append((piece.piece_type, square))
+    
+    return attack_map
+
+def get_piece_value(piece_type):
+    """Get the value of a piece type."""
+    values = {
+        chess.PAWN: 100,
+        chess.KNIGHT: 320,
+        chess.BISHOP: 330,
+        chess.ROOK: 500,
+        chess.QUEEN: 900,
+        chess.KING: 20000
+    }
+    return values.get(piece_type, 0)
+
+# Early game piece-square tables
+pst_early = {
+    'P': [  # Pawns (early game)
+        [  0,   0,   0,   0,   0,   0,   0,   0],
+        [ 50,  50,  50,  50,  50,  50,  50,  50],
+        [ 10,  10,  20,  30,  30,  20,  10,  10],
+        [  5,   5,  10,  25,  25,  10,   5,   5],
+        [  0,   0,   0,  20,  20,   0,   0,   0],
+        [  5,  -5, -10,   0,   0, -10,  -5,   5],
+        [  5,  10,  10, -20, -20,  10,  10,   5],
+        [  0,   0,   0,   0,   0,   0,   0,   0]
+    ],
+    'N': [  # Knights (early game)
+        [-50, -40, -30, -30, -30, -30, -40, -50],
+        [-40, -20,   0,   0,   0,   0, -20, -40],
+        [-30,   0,  10,  15,  15,  10,   0, -30],
+        [-30,   5,  15,  20,  20,  15,   5, -30],
+        [-30,   0,  15,  20,  20,  15,   0, -30],
+        [-30,   5,  10,  15,  15,  10,   5, -30],
+        [-40, -20,   0,   5,   5,   0, -20, -40],
+        [-50, -40, -30, -30, -30, -30, -40, -50]
+    ],
+    'B': [  # Bishops (early game)
+        [-20, -10, -10, -10, -10, -10, -10, -20],
+        [-10,   0,   0,   0,   0,   0,   0, -10],
+        [-10,   0,  10,  10,  10,  10,   0, -10],
+        [-10,   5,   5,  10,  10,   5,   5, -10],
+        [-10,   0,   5,  10,  10,   5,   0, -10],
+        [-10,  10,  10,  10,  10,  10,  10, -10],
+        [-10,   5,   0,   0,   0,   0,   5, -10],
+        [-20, -10, -10, -10, -10, -10, -10, -20]
+    ],
+    'R': [  # Rooks (early game)
+        [  0,   0,   0,   0,   0,   0,   0,   0],
+        [  5,  10,  10,  10,  10,  10,  10,   5],
+        [ -5,   0,   0,   0,   0,   0,   0,  -5],
+        [ -5,   0,   0,   0,   0,   0,   0,  -5],
+        [ -5,   0,   0,   0,   0,   0,   0,  -5],
+        [ -5,   0,   0,   0,   0,   0,   0,  -5],
+        [ -5,   0,   0,   0,   0,   0,   0,  -5],
+        [  0,   0,   0,   5,   5,   0,   0,   0]
+    ],
+    'Q': [  # Queen (early game)
+        [-20, -10, -10,  -5,  -5, -10, -10, -20],
+        [-10,   0,   0,   0,   0,   0,   0, -10],
+        [-10,   0,   5,   5,   5,   5,   0, -10],
+        [ -5,   0,   5,   5,   5,   5,   0,  -5],
+        [  0,   0,   5,   5,   5,   5,   0,  -5],
+        [-10,   5,   5,   5,   5,   5,   0, -10],
+        [-10,   0,   5,   0,   0,   0,   0, -10],
+        [-20, -10, -10,  -5,  -5, -10, -10, -20]
+    ],
+    'K': [  # King (early game)
+        [-30, -40, -40, -50, -50, -40, -40, -30],
+        [-30, -40, -40, -50, -50, -40, -40, -30],
+        [-30, -40, -40, -50, -50, -40, -40, -30],
+        [-30, -40, -40, -50, -50, -40, -40, -30],
+        [-20, -30, -30, -40, -40, -30, -30, -20],
+        [-10, -20, -20, -20, -20, -20, -20, -10],
+        [ 20,  20,   0,   0,   0,   0,  20,  20],
+        [ 20,  30,  10,   0,   0,  10,  30,  20]
+    ],
+    'K_e': [  # King (endgame)
+        [-50, -40, -30, -20, -20, -30, -40, -50],
+        [-30, -20, -10,   0,   0, -10, -20, -30],
+        [-30, -10,  20,  30,  30,  20, -10, -30],
+        [-30, -10,  30,  40,  40,  30, -10, -30],
+        [-30, -10,  30,  40,  40,  30, -10, -30],
+        [-30, -10,  20,  30,  30,  20, -10, -30],
+        [-30, -30,   0,   0,   0,   0, -30, -30],
+        [-50, -30, -30, -30, -30, -30, -30, -50]
+    ]
+}
+
+# End game piece-square tables
+pst_end = {
+    'P': [  # Pawns (end game)
+        [  0,   0,   0,   0,   0,   0,   0,   0],
+        [ 80,  80,  80,  80,  80,  80,  80,  80],
+        [ 50,  50,  50,  50,  50,  50,  50,  50],
+        [ 30,  30,  30,  40,  40,  30,  30,  30],
+        [ 20,  20,  20,  30,  30,  20,  20,  20],
+        [ 10,  10,  10,  10,  10,  10,  10,  10],
+        [ 10,  10,  10,  10,  10,  10,  10,  10],
+        [  0,   0,   0,   0,   0,   0,   0,   0]
+    ],
+    'N': [  # Knights (end game)
+        [-50, -40, -30, -30, -30, -30, -40, -50],
+        [-40, -20,   0,   5,   5,   0, -20, -40],
+        [-30,   5,  15,  20,  20,  15,   5, -30],
+        [-30,   0,  15,  20,  20,  15,   0, -30],
+        [-30,   5,  15,  20,  20,  15,   5, -30],
+        [-30,   0,  10,  15,  15,  10,   0, -30],
+        [-40, -20,   0,   0,   0,   0, -20, -40],
+        [-50, -40, -30, -30, -30, -30, -40, -50]
+    ],
+    'B': [  # Bishops (end game)
+        [-20, -10, -10, -10, -10, -10, -10, -20],
+        [-10,   0,   0,   0,   0,   0,   0, -10],
+        [-10,   0,  10,  10,  10,  10,   0, -10],
+        [-10,   5,   5,  10,  10,   5,   5, -10],
+        [-10,   0,   5,  10,  10,   5,   0, -10],
+        [-10,   5,   5,   5,   5,   5,   5, -10],
+        [-10,   0,   0,   0,   0,   0,   0, -10],
+        [-20, -10, -10, -10, -10, -10, -10, -20]
+    ],
+    'R': [  # Rooks (end game)
+        [  0,   0,   0,   5,   5,   0,   0,   0],
+        [ -5,   0,   0,   0,   0,   0,   0,  -5],
+        [ -5,   0,   0,   0,   0,   0,   0,  -5],
+        [ -5,   0,   0,   0,   0,   0,   0,  -5],
+        [ -5,   0,   0,   0,   0,   0,   0,  -5],
+        [ -5,   0,   0,   0,   0,   0,   0,  -5],
+        [  5,  10,  10,  10,  10,  10,  10,   5],
+        [  0,   0,   0,   0,   0,   0,   0,   0]
+    ],
+    'Q': [  # Queen (end game)
+        [-20, -10, -10,  -5,  -5, -10, -10, -20],
+        [-10,   0,   5,   0,   0,   0,   0, -10],
+        [-10,   5,   5,   5,   5,   5,   0, -10],
+        [  0,   0,   5,   5,   5,   5,   0,  -5],
+        [ -5,   0,   5,   5,   5,   5,   0,  -5],
+        [-10,   0,   5,   5,   5,   5,   0, -10],
+        [-10,   0,   0,   0,   0,   0,   0, -10],
+        [-20, -10, -10,  -5,  -5, -10, -10, -20]
+    ],
+    'K': [  # King (end game) - same as K_e in early game
+        [-50, -40, -30, -20, -20, -30, -40, -50],
+        [-30, -20, -10,   0,   0, -10, -20, -30],
+        [-30, -10,  20,  30,  30,  20, -10, -30],
+        [-30, -10,  30,  40,  40,  30, -10, -30],
+        [-30, -10,  30,  40,  40,  30, -10, -30],
+        [-30, -10,  20,  30,  30,  20, -10, -30],
+        [-30, -30,   0,   0,   0,   0, -30, -30],
+        [-50, -30, -30, -30, -30, -30, -30, -50]
+    ],
+    'K_e': [  # King (endgame) - same as K in end game
+        [-50, -40, -30, -20, -20, -30, -40, -50],
+        [-30, -20, -10,   0,   0, -10, -20, -30],
+        [-30, -10,  20,  30,  30,  20, -10, -30],
+        [-30, -10,  30,  40,  40,  30, -10, -30],
+        [-30, -10,  30,  40,  40,  30, -10, -30],
+        [-30, -10,  20,  30,  30,  20, -10, -30],
+        [-30, -30,   0,   0,   0,   0, -30, -30],
+        [-50, -30, -30, -30, -30, -30, -30, -50]
+    ]
+}
+
 def classical_evaluate(board):
     """
     Classical evaluation function as a fallback.
@@ -333,8 +518,18 @@ def classical_evaluate(board):
     # Development score - bonus for developed pieces and center control
     development_score = 0
     
-    # King movement penalty score
-    king_movement_score = 0
+    # King safety score
+    king_safety_score = 0
+    
+    # Get attack maps for both sides
+    white_attack_map = get_attack_map(board, chess.WHITE)
+    black_attack_map = get_attack_map(board, chess.BLACK)
+    
+    # Attack score - based on attack maps
+    attack_score = 0
+    
+    # Select the appropriate piece-square tables based on game phase
+    pst_tables = pst_early if not is_endgame else pst_end
     
     # Calculate material and piece-square scores
     for square in chess.SQUARES:
@@ -343,7 +538,7 @@ def classical_evaluate(board):
             continue
             
         # Material score
-        value = piece_values[piece.piece_type]
+        value = get_piece_value(piece.piece_type)
         if piece.color == chess.WHITE:
             material_score += value
         else:
@@ -359,128 +554,116 @@ def classical_evaluate(board):
         else:
             piece_symbol = piece.symbol().upper()  # Piece symbol ('P', 'N', etc.)
             
-        if piece_symbol in pst:
+        if piece_symbol in pst_tables:
             # Add score with rank mirroring for black
             if piece.color == chess.WHITE:
-                pst_score += pst[piece_symbol][7 - rank_idx][file_idx]
+                pst_score += pst_tables[piece_symbol][7 - rank_idx][file_idx]
             else:
-                pst_score -= pst[piece_symbol][rank_idx][file_idx]
+                pst_score -= pst_tables[piece_symbol][rank_idx][file_idx]
         
-        # Development bonuses for early game
+        # Development score for early game
         if is_early_game:
-            # Center control bonus (pieces on or controlling center)
-            center_squares = [chess.E4, chess.D4, chess.E5, chess.D5]
-            extended_center = [
-                chess.C3, chess.D3, chess.E3, chess.F3,
-                chess.C4, chess.F4, chess.C5, chess.F5,
-                chess.C6, chess.D6, chess.E6, chess.F6
-            ]
-            
-            # Knights and bishops developed (not on home rank)
-            if piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
-                home_rank = 0 if piece.color == chess.WHITE else 7
-                if rank_idx != home_rank:
-                    # Bonus for developed minor piece
-                    dev_bonus = 25
-                    if piece.color == chess.WHITE:
-                        development_score += dev_bonus
-                    else:
-                        development_score -= dev_bonus
-            
-            # Bonus for controlling center squares
-            if piece.piece_type != chess.KING:  # King doesn't get center bonus
-                if square in center_squares:
-                    center_bonus = 30
-                    if piece.color == chess.WHITE:
-                        development_score += center_bonus
-                    else:
-                        development_score -= center_bonus
-                elif square in extended_center:
-                    center_bonus = 15
-                    if piece.color == chess.WHITE:
-                        development_score += center_bonus
-                    else:
-                        development_score -= center_bonus
-    
-    # King movement penalties in early game
-    starting_king_squares = {
-        chess.WHITE: chess.E1,
-        chess.BLACK: chess.E8
-    }
-    
-    # Check if kings have moved (except for castling)
-    if is_early_game:
-        for color in [chess.WHITE, chess.BLACK]:
-            king_square = board.king(color)
-            castled = False
-            
-            # Detect castling
-            if color == chess.WHITE:
-                if king_square in [chess.G1, chess.C1]:
-                    castled = True
+            if piece.color == chess.WHITE:
+                # Bonus for knights and bishops being developed
+                if piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
+                    if rank_idx > 0:  # Piece has moved from starting position
+                        development_score += 10
+                # Penalty for undeveloped pieces
+                elif piece.piece_type == chess.QUEEN:
+                    if rank_idx == 0 and file_idx == 3:  # Queen still on starting square
+                        development_score -= 5
             else:
-                if king_square in [chess.G8, chess.C8]:
-                    castled = True
-            
-            # Apply penalty if king moved but didn't castle
-            if king_square != starting_king_squares[color] and not castled:
-                # Severe penalty for early king movement (except castling)
-                early_king_move_penalty = 100
-                if color == chess.WHITE:
-                    king_movement_score -= early_king_move_penalty
-                else:
-                    king_movement_score += early_king_move_penalty
+                # Same for black
+                if piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
+                    if rank_idx < 7:  # Piece has moved from starting position
+                        development_score -= 10
+                elif piece.piece_type == chess.QUEEN:
+                    if rank_idx == 7 and file_idx == 3:  # Queen still on starting square
+                        development_score += 5
     
-    # King safety (enhanced version)
-    king_safety_score = 0
-    for color in [chess.WHITE, chess.BLACK]:
-        # Penalty for exposed king in middle game
-        if not is_endgame:
-            king_square = board.king(color)
-            if king_square is not None:
-                file_idx = chess.square_file(king_square)
+    # Calculate attack score based on attack maps
+    for square in chess.SQUARES:
+        # Check if square is attacked by white
+        white_attackers = white_attack_map.get(square, [])
+        black_attackers = black_attack_map.get(square, [])
+        
+        # Get piece on the square (if any)
+        piece = board.piece_at(square)
+        
+        if piece:
+            # If white piece is attacked by black
+            if piece.color == chess.WHITE and black_attackers:
+                # Calculate the exchange value
+                min_attacker_value = min([get_piece_value(attacker[0]) for attacker in black_attackers])
+                piece_value = get_piece_value(piece.piece_type)
                 
-                # Penalize central king in middlegame
-                central_penalty = 0
-                if 2 < file_idx < 5:
-                    central_penalty = 40  # Increased from 20
-                
-                if color == chess.WHITE:
-                    king_safety_score -= central_penalty
-                else:
-                    king_safety_score += central_penalty
-    
-    # Pawn structure (basic)
-    pawn_structure_score = 0
-    for color in [chess.WHITE, chess.BLACK]:
-        # Doubled pawns (penalty)
-        for file_idx in range(8):
-            pawns_on_file = 0
-            for rank_idx in range(8):
-                square = chess.square(file_idx, rank_idx)
-                piece = board.piece_at(square)
-                if piece and piece.piece_type == chess.PAWN and piece.color == color:
-                    pawns_on_file += 1
+                # If piece is undefended or attacker is less valuable
+                if not white_attackers or min_attacker_value < piece_value:
+                    attack_score -= (piece_value - min_attacker_value) // 10
             
-            # Penalty for doubled pawns
-            if pawns_on_file > 1:
-                if color == chess.WHITE:
-                    pawn_structure_score -= (pawns_on_file - 1) * 20
-                else:
-                    pawn_structure_score += (pawns_on_file - 1) * 20
+            # If black piece is attacked by white
+            elif piece.color == chess.BLACK and white_attackers:
+                # Calculate the exchange value
+                min_attacker_value = min([get_piece_value(attacker[0]) for attacker in white_attackers])
+                piece_value = get_piece_value(piece.piece_type)
+                
+                # If piece is undefended or attacker is less valuable
+                if not black_attackers or min_attacker_value < piece_value:
+                    attack_score += (piece_value - min_attacker_value) // 10
     
-    # Combine all evaluation terms
+    # King safety evaluation
+    white_king_square = board.king(chess.WHITE)
+    black_king_square = board.king(chess.BLACK)
+    
+    if white_king_square:
+        # Count attacks near the white king
+        white_king_file = chess.square_file(white_king_square)
+        white_king_rank = chess.square_rank(white_king_square)
+        
+        white_king_danger = 0
+        for file_offset in range(-1, 2):
+            for rank_offset in range(-1, 2):
+                file = white_king_file + file_offset
+                rank = white_king_rank + rank_offset
+                
+                if 0 <= file < 8 and 0 <= rank < 8:
+                    square = chess.square(file, rank)
+                    if square in black_attack_map:
+                        white_king_danger += len(black_attack_map[square])
+        
+        # Penalize exposed white king
+        king_safety_score -= white_king_danger * 5
+    
+    if black_king_square:
+        # Count attacks near the black king
+        black_king_file = chess.square_file(black_king_square)
+        black_king_rank = chess.square_rank(black_king_square)
+        
+        black_king_danger = 0
+        for file_offset in range(-1, 2):
+            for rank_offset in range(-1, 2):
+                file = black_king_file + file_offset
+                rank = black_king_rank + rank_offset
+                
+                if 0 <= file < 8 and 0 <= rank < 8:
+                    square = chess.square(file, rank)
+                    if square in white_attack_map:
+                        black_king_danger += len(white_attack_map[square])
+        
+        # Penalize exposed black king
+        king_safety_score += black_king_danger * 5
+    
+    # Combine all evaluation components
     total_score = (
-        material_score +
-        pst_score +
-        mobility_score +
-        king_safety_score +
-        pawn_structure_score +
-        development_score +
-        king_movement_score
+        material_score + 
+        pst_score + 
+        mobility_score + 
+        development_score + 
+        attack_score + 
+        king_safety_score
     )
     
-    # Return score from perspective of current player
+    # Return score from current player's perspective
     return total_score if board.turn == chess.WHITE else -total_score
 
 def get_non_pawn_material(board, color):
