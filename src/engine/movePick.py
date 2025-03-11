@@ -68,10 +68,10 @@ def pick_move(board, moves, info, hash_move=None, ply=0):
             if board.is_en_passant(move):
                 score = 1000500  # Between regular capture and promotion
         
-        # 3. Killer moves
-        elif move == info.killer_moves[ply][0]:
+        # 3. Killer moves (with safety check for index)
+        elif ply < len(info.killer_moves) and info.killer_moves[ply] and move == info.killer_moves[ply][0]:
             score = 900000
-        elif move == info.killer_moves[ply][1]:
+        elif ply < len(info.killer_moves) and len(info.killer_moves[ply]) > 1 and move == info.killer_moves[ply][1]:
             score = 800000
         
         # 4. History heuristic for quiet moves

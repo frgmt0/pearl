@@ -9,8 +9,5 @@ wheels/
 # Virtual environments
 .venv
 
-chess_terminal/saved_games/
-chess_terminal/notes.txt
-logs/
-saved_models/
-chess_terminal/temp_data/
+CLAUDE.md
+pgns/

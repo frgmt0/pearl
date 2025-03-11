@@ -118,8 +118,17 @@ class EngineVsStockfish:
         if not move:
             return False, "Engine couldn't find a move", None
         
-        # Make the move
-        move_san = self.board.board.san(move)
+        # Check if move is legal before continuing
+        if move not in self.board.board.legal_moves:
+            return False, f"Engine suggested illegal move: {move}", None
+        
+        try:
+            # Get SAN representation (after verifying legality)
+            move_san = self.board.board.san(move)
+        except Exception as e:
+            # If there's an error with san(), try to continue
+            print(f"Warning: Error getting SAN notation - {e}")
+            move_san = move.uci()  # Fall back to UCI notation
         
         # Store the position before the move for learning
         prev_position = chess.Board(self.board.get_fen())
@@ -194,8 +203,25 @@ class EngineVsStockfish:
         except ValueError:
             return False, f"Invalid move from Stockfish: {move_uci}", None
         
+        # Verify move legality
+        if move not in self.board.board.legal_moves:
+            # Try to find a legal move as fallback
+            legal_moves = list(self.board.board.legal_moves)
+            if legal_moves:
+                move = legal_moves[0]  # Choose the first legal move
+                print(f"Warning: Stockfish suggested illegal move: {move_uci}, using {move} instead")
+            else:
+                return False, f"Stockfish suggested illegal move: {move_uci} and no legal moves available", None
+        
+        # Get SAN representation
+        try:
+            move_san = self.board.board.san(move)
+        except Exception as e:
+            # If there's an error with san(), try to continue
+            print(f"Warning: Error getting SAN notation - {e}")
+            move_san = move.uci()  # Fall back to UCI notation
+            
         # Make the move
-        move_san = self.board.board.san(move)
         self.board.make_move(move)
         
         # Store current position and evaluation in history
@@ -435,6 +461,14 @@ def play_engine_vs_stockfish(engine=None, engine_depth=5, engine_time_ms=1000, s
         engine_color=engine_color
     )
     
+    # Explicitly load the latest model
+    print("\033[1;36mLoading latest model weights...\033[0m")
+    if game.engine.load_model():
+        weights_path = game.engine.get_current_weights_path()
+        print(f"\033[1;32m✓ Successfully loaded model: {weights_path}\033[0m")
+    else:
+        print("\033[1;31m✗ Could not load latest model weights, using current model\033[0m")
+    
     # Print game information
     print("Starting Engine vs Stockfish game")
     print(f"Engine color: {'White' if engine_color == chess.WHITE else 'Black'}")
@@ -475,26 +509,149 @@ def play_engine_vs_stockfish(engine=None, engine_depth=5, engine_time_ms=1000, s
         if result['learned_from_stockfish']:
             print("Engine learned from Stockfish's good moves")
             
-        # Ask to save the trained model
-        save = input("\nSave trained engine model? (y/n): ")
-        if save.lower() == 'y':
-            if hasattr(game.engine, 'save_model'):
-                path = game.engine.save_model("nnue_weights_after_stockfish_game")
-                print(f"Model saved to {path}")
-            else:
-                print("Engine does not support saving models")
+        # Automatically save the trained model
+        if hasattr(game.engine, 'save_model'):
+            path = game.engine.save_model("nnue_weights_after_stockfish_game")
+            print(f"Model automatically saved to {path}")
+        else:
+            print("Engine does not support saving models")
     
     # Save PGN
     timestamp = int(time.time())
     pgn_filename = f"engine_vs_stockfish_{timestamp}.pgn"
-    with open(pgn_filename, 'w') as f:
+    
+    # Save to pgns directory
+    os.makedirs("pgns", exist_ok=True)
+    pgn_path = os.path.join("pgns", pgn_filename)
+    with open(pgn_path, 'w') as f:
         f.write(game.get_pgn())
     
-    print(f"Game saved to {pgn_filename}")
+    print(f"Game saved to {pgn_path}")
     
     # Save detailed log
     log_filename = game.save_game_log()
     print(f"Detailed log saved to {log_filename}")
+    
+    # Update engine statistics
+    if hasattr(game.engine, 'game_stats'):
+        game.engine.game_stats['games_played'] += 1
+        
+        if result['is_draw']:
+            game.engine.game_stats['draws'] += 1
+        elif result['engine_won']:
+            game.engine.game_stats['wins'] += 1
+        else:
+            game.engine.game_stats['losses'] += 1
+            
+        # Calculate win rate
+        total_games = game.engine.game_stats['games_played']
+        if total_games > 0:
+            win_rate = (game.engine.game_stats['wins'] / total_games) * 100
+            game.engine.game_stats['win_rate'] = win_rate
+            
+        print("\nEngine Statistics:")
+        print(f"Games played: {game.engine.game_stats['games_played']}")
+        print(f"Wins: {game.engine.game_stats['wins']}")
+        print(f"Losses: {game.engine.game_stats['losses']}")
+        print(f"Draws: {game.engine.game_stats['draws']}")
+        print(f"Win rate: {game.engine.game_stats['win_rate']:.1f}%")
+    
+    # Automatically finetune the model using this game
+    if game.enable_learning and not result['is_draw']:
+        # Import here to avoid circular imports
+        from src.engine.finetune import finetune_from_pgn
+        
+        # Prepare feedback based on game result
+        feedback = None
+        emphasis = 2.0  # Increased emphasis factor
+        
+        if result['engine_won']:
+            # Engine won, reinforce good moves and learn only from engine's moves
+            feedback = {
+                "result": "win", 
+                "emphasis": emphasis,
+                "learn_from_winner": True,
+                "engine_color": "white" if engine_color == chess.WHITE else "black"
+            }
+            print("\n\033[1;32m🎮 Automatically finetuning model to reinforce winning strategies...\033[0m")
+            print(f"\033[1;33m📊 Using emphasis factor: {emphasis}x\033[0m")
+            print(f"\033[1;32m🏆 Learning selectively from winning moves (engine's moves)\033[0m")
+        else:
+            # Engine lost, learn from Stockfish's winning moves
+            # Use inverse learning for losses - learn what NOT to do
+            feedback = {
+                "result": "loss", 
+                "emphasis": emphasis,
+                "learn_from_winner": True,
+                "engine_color": "white" if engine_color == chess.WHITE else "black",
+                "inverse_learning": True  # Learn what NOT to do by inverting evaluations
+            }
+            print("\n\033[1;35m🎮 Automatically finetuning model to learn from Stockfish's strategies...\033[0m")
+            print(f"\033[1;33m📊 Using emphasis factor: {emphasis}x\033[0m")
+            print(f"\033[1;32m🏆 Learning selectively from winning moves (Stockfish's moves)\033[0m")
+            print(f"\033[1;31m⚠️ Using INVERSE LEARNING: Penalizing engine's losing moves\033[0m")
+        
+        try:
+            # Use more epochs with curriculum learning and memory for better retention
+            print("\033[1;36m🚀 Starting advanced finetuning process (50 epochs)...\033[0m")
+            print("\033[1;33m🧠 Using position memory and curriculum learning\033[0m")
+            
+            # Get user confirmation for enhanced model if we'll be creating a new one
+            use_enhanced = False
+            try:
+                # Check if we already have a base.pt model
+                import os
+                if not os.path.exists("saved_models/base.pt"):
+                    # First-time training - offer enhanced architecture
+                    print("\033[1;35m⭐ No existing model found - would you like to use the enhanced Stockfish-style architecture?\033[0m")
+                    print("\033[1;33m⚠️ Note: This will create a new model from scratch with more parameters (8M vs 260K)\033[0m")
+                    print("\033[1;33m⚠️ Training and inference will be slower, but potential for stronger play is higher\033[0m")
+                    response = input("Use enhanced architecture? (y/n): ")
+                    use_enhanced = response.lower() == 'y'
+                    if use_enhanced:
+                        print("\033[1;32m🎯 Creating new enhanced model from scratch\033[0m")
+                    else:
+                        print("\033[1;32m🎯 Creating standard model\033[0m")
+                else:
+                    # Try to determine if existing model is enhanced
+                    # This is just a quick check - we'll create the right type of model
+                    # to receive weights during finetuning
+                    try:
+                        # Create a temporary model to check
+                        from src.engine.nnue.network import NNUE
+                        temp_model = NNUE(use_enhanced=True)
+                        
+                        # Try to load it - will fail if architectures don't match
+                        from src.engine.nnue.weights import load_weights
+                        _ = load_weights(temp_model, "saved_models/base.pt")
+                        
+                        # If we got here, then enhanced model loaded successfully
+                        use_enhanced = True
+                        print("\033[1;32m🎯 Using existing enhanced model\033[0m")
+                    except:
+                        # Failure means it's a standard model
+                        use_enhanced = False
+                        print("\033[1;32m🎯 Using existing standard model\033[0m")
+            except Exception as e:
+                print(f"\033[1;31m⚠️ Error detecting model type: {e}\033[0m")
+                print("\033[1;33m⚠️ Using standard model for safety\033[0m")
+                use_enhanced = False
+                
+            # Run finetuning with all our enhancements
+            # Convert old enhanced flag to model_type
+            model_type = "pearl" if use_enhanced else "standard"
+            
+            finetune_from_pgn(
+                pgn_path, 
+                epochs=50, 
+                batch_size=32, 
+                feedback=feedback,
+                model_type=model_type,
+                use_memory=True
+            )
+            print("\033[1;32m✅ Finetuning complete! Model updated to base.pt for next game\033[0m")
+        except Exception as e:
+            print(f"Error during finetuning: {e}")
     
     return result
 
@@ -515,13 +672,13 @@ if __name__ == "__main__":
     else:
         engine_color = chess.WHITE
         
-    # Create engine with learning enabled
-    engine = NNUEEngine(depth=engine_depth, time_limit_ms=1000, enable_learning=True)
+    # Create engine with learning enabled and 30-second safe time limit
+    engine = NNUEEngine(depth=5, time_limit_ms=30000, enable_learning=True)
     
     play_engine_vs_stockfish(
         engine=engine,
-        engine_depth=engine_depth,
-        engine_time_ms=1000,
+        engine_depth=5,  # Use a more reliable depth
+        engine_time_ms=15000,  # 15 seconds per move is safer
         stockfish_depth=stockfish_depth,
         engine_color=engine_color
     )

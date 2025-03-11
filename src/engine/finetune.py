@@ -7,28 +7,171 @@ import numpy as np
 from datetime import datetime
 import os
 import time
+import pickle
 from collections import deque
 import json
 
-from src.engine.nnue.network import NNUE, board_to_features
-from src.engine.nnue.trainer import NNUETrainer, ChessPositionDataset
-from src.engine.nnue.weights import save_weights, load_weights, get_latest_weights
+from src.engine.score import create_model, save_model, load_model
+from src.engine.nnue.network import board_to_features, NNUE
+
+class PositionMemory:
+    """
+    Long-term memory for chess positions and their evaluations.
+    Persistently stores positions across multiple games for enhanced learning.
+    """
+    def __init__(self, max_positions=50000, persistent_file="saved_models/position_memory.pkl"):
+        """
+        Initialize the position memory.
+        
+        Args:
+            max_positions: Maximum number of positions to store
+            persistent_file: File to save/load the memory
+        """
+        self.positions = {}  # Dictionary of {fen: (eval, timestamp, importance)}
+        self.max_positions = max_positions
+        self.persistent_file = persistent_file
+        
+        # Try to load existing memory
+        self.load()
+    
+    def add_position(self, fen, eval_score, importance=1.0):
+        """
+        Add a position to memory or update existing one.
+        
+        Args:
+            fen: FEN string of the position
+            eval_score: Evaluation score for the position
+            importance: Importance factor (higher = more important to remember)
+        """
+        # Store with current timestamp
+        timestamp = time.time()
+        
+        # If position exists, update with weighted average
+        if fen in self.positions:
+            old_eval, old_timestamp, old_importance = self.positions[fen]
+            # Weight new evaluation higher if it's more important
+            weighted_eval = (old_eval * old_importance + eval_score * importance) / (old_importance + importance)
+            # Increase importance
+            new_importance = min(old_importance + importance, 5.0)
+            self.positions[fen] = (weighted_eval, timestamp, new_importance)
+        else:
+            # Add new position
+            self.positions[fen] = (eval_score, timestamp, importance)
+        
+        # Trim memory if needed
+        if len(self.positions) > self.max_positions:
+            self._trim_memory()
+    
+    def _trim_memory(self):
+        """Remove least important/oldest positions to maintain size limit."""
+        # Calculate a score for each position based on age and importance
+        position_scores = []
+        current_time = time.time()
+        
+        for fen, (_, timestamp, importance) in self.positions.items():
+            # Score formula: importance / age
+            age = max(current_time - timestamp, 1)  # In seconds
+            score = importance / age
+            position_scores.append((fen, score))
+        
+        # Sort by score (lowest first)
+        position_scores.sort(key=lambda x: x[1])
+        
+        # Remove 10% of positions with lowest scores
+        positions_to_remove = int(len(position_scores) * 0.1)
+        for i in range(positions_to_remove):
+            fen = position_scores[i][0]
+            del self.positions[fen]
+    
+    def get_training_batch(self, batch_size=1000):
+        """
+        Get a batch of positions for training, prioritizing important ones.
+        
+        Args:
+            batch_size: Number of positions to return
+            
+        Returns:
+            List of (fen, eval) tuples
+        """
+        if not self.positions:
+            return []
+            
+        # Calculate selection probability based on importance
+        position_items = list(self.positions.items())
+        importances = [item[1][2] for item in position_items]
+        total_importance = sum(importances)
+        
+        if total_importance == 0:
+            # If all importances are 0, use uniform distribution
+            probs = None
+        else:
+            # Convert to probabilities
+            probs = [imp / total_importance for imp in importances]
+        
+        # Select positions with replacement, weighted by importance
+        selected_indices = np.random.choice(
+            len(position_items), 
+            size=min(batch_size, len(position_items)),
+            replace=True,
+            p=probs
+        )
+        
+        # Extract selected positions
+        selected_positions = []
+        for idx in selected_indices:
+            fen, (eval_score, _, _) = position_items[idx]
+            selected_positions.append((fen, eval_score))
+            
+        return selected_positions
+    
+    def save(self):
+        """Save the memory to a file."""
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(self.persistent_file), exist_ok=True)
+            
+            with open(self.persistent_file, 'wb') as f:
+                pickle.dump(self.positions, f)
+            print(f"Position memory saved ({len(self.positions)} positions)")
+            return True
+        except Exception as e:
+            print(f"Error saving position memory: {e}")
+            return False
+    
+    def load(self):
+        """Load the memory from a file."""
+        try:
+            if os.path.exists(self.persistent_file):
+                with open(self.persistent_file, 'rb') as f:
+                    self.positions = pickle.load(f)
+                print(f"Position memory loaded ({len(self.positions)} positions)")
+                return True
+            return False
+        except Exception as e:
+            print(f"Error loading position memory: {e}")
+            self.positions = {}
+            return False
+
+# Global instance of position memory
+POSITION_MEMORY = PositionMemory()
 
 class SelfPlayData:
     """
     Class for collecting self-play data to fine-tune the NNUE model.
     """
-    def __init__(self, max_positions=10000):
+    def __init__(self, max_positions=10000, use_memory=True):
         """
         Initialize self-play data collector.
         
         Args:
             max_positions: Maximum number of positions to store
+            use_memory: Whether to use the global position memory
         """
         self.positions = deque(maxlen=max_positions)
         self.results = {"white_win": 0, "black_win": 0, "draw": 0}
+        self.use_memory = use_memory
         
-    def add_game(self, game_history, result, evaluations=None):
+    def add_game(self, game_history, result, evaluations=None, position_qualities=None):
         """
         Add a completed game to the dataset.
         
@@ -36,6 +179,7 @@ class SelfPlayData:
             game_history: List of FEN strings from the game
             result: Game result ('white_win', 'black_win', 'draw')
             evaluations: Optional list of evaluations for each position
+            position_qualities: Optional list of quality scores (0.0-2.0) for positions
         """
         # Update results counter
         if result in self.results:
@@ -53,16 +197,41 @@ class SelfPlayData:
         else:  # draw
             final_score = 0.0
         
+        # Calculate result importance - decisive games are more important
+        result_importance = 1.5 if result != "draw" else 1.0
+        
         # If evaluations are provided, use them
         if evaluations and len(evaluations) == len(game_history):
-            for fen, eval_score in zip(game_history, evaluations):
+            for i, (fen, eval_score) in enumerate(zip(game_history, evaluations)):
+                # Calculate position importance based on game progression and result
+                # End-game positions are more important
+                if position_qualities and i < len(position_qualities):
+                    # Use provided quality score if available
+                    position_importance = position_qualities[i]
+                else:
+                    # Otherwise calculate based on position in game
+                    position_importance = 1.0 + (i / len(game_history)) * 0.5
+                
+                # For decisive games, increase importance of positions aligned with final result
+                if result != "draw":
+                    # If evaluation matches result direction, boost importance
+                    if (eval_score > 0 and result == "white_win") or (eval_score < 0 and result == "black_win"):
+                        eval_bonus = min(1.0, abs(eval_score) / 300) * 0.5
+                        position_importance += eval_bonus
+                
                 # Store position with evaluation
                 self.positions.append((fen, eval_score))
+                
+                # Also add to global position memory if enabled
+                if self.use_memory:
+                    # Multiply importances for overall importance
+                    importance = result_importance * position_importance
+                    POSITION_MEMORY.add_position(fen, eval_score, importance)
         else:
             # Assign decaying values based on result
             # Positions closer to the end get stronger values
             game_length = len(game_history)
-            decay_factor = 0.9  # How quickly the value decays as we go backward
+            decay_factor = 0.8  # Reduced to make end-game lessons stronger
             
             for i, fen in enumerate(game_history):
                 # Calculate position value (decays as we go backward from end)
@@ -75,15 +244,95 @@ class SelfPlayData:
                 
                 # Store position with calculated value
                 self.positions.append((fen, scaled_value))
+                
+                # Also add to global position memory if enabled
+                if self.use_memory:
+                    # Calculate position importance
+                    if position_qualities and i < len(position_qualities):
+                        # Use provided quality score if available
+                        position_importance = position_qualities[i]
+                    else:
+                        # Otherwise calculate based on position in game
+                        position_importance = 1.0 + (i / len(game_history)) * 0.5
+                    
+                    # Multiply importances for overall importance
+                    importance = result_importance * position_importance
+                    POSITION_MEMORY.add_position(fen, scaled_value, importance)
+        
+        # Save the position memory after adding a game
+        if self.use_memory:
+            POSITION_MEMORY.save()
     
-    def create_dataset(self):
+    def create_dataset(self, include_memory=True, memory_ratio=0.5, memory_batch_size=1000):
         """
         Create a PyTorch dataset from collected positions.
         
+        Args:
+            include_memory: Whether to include positions from global memory
+            memory_ratio: Ratio of memory positions to current game positions (0-1)
+            memory_batch_size: Number of positions to sample from memory
+            
         Returns:
             ChessPositionDataset
         """
-        return ChessPositionDataset(list(self.positions))
+        # Start with current game positions
+        dataset_positions = list(self.positions)
+        
+        # Add positions from memory if enabled
+        if include_memory and self.use_memory and len(POSITION_MEMORY.positions) > 0:
+            # Determine how many memory positions to include (balancing with current positions)
+            if len(dataset_positions) > 0:
+                memory_size = int(len(dataset_positions) * memory_ratio / (1 - memory_ratio))
+                memory_size = min(memory_size, memory_batch_size)
+            else:
+                memory_size = memory_batch_size
+                
+            # Sample positions from memory
+            if memory_size > 0:
+                memory_positions = POSITION_MEMORY.get_training_batch(memory_size)
+                
+                # Print statistics
+                print(f"Using {len(dataset_positions)} positions from current game + " 
+                      f"{len(memory_positions)} positions from memory")
+                
+                # Combine with current positions
+                dataset_positions.extend(memory_positions)
+        
+        # Pre-process the positions to ensure we have consistent feature sizes
+        # Import our feature extractor
+        from src.engine.nnue.network import board_to_features
+        
+        # Convert positions to features
+        processed_positions = []
+        for fen, eval_score in dataset_positions:
+            # Check if this is already a feature tensor
+            if torch.is_tensor(fen):
+                processed_positions.append((fen, eval_score))
+                continue
+            
+            # Convert FEN to board
+            if not isinstance(fen, str):
+                fen = str(fen)
+            board = chess.Board(fen)
+            
+            # Extract features
+            features = board_to_features(board)
+            processed_positions.append((features, eval_score))
+        
+        # Define a simple dataset class right here to avoid circular imports
+        class ChessPositionDataset(torch.utils.data.Dataset):
+            def __init__(self, positions):
+                self.positions = positions
+
+            def __len__(self):
+                return len(self.positions)
+
+            def __getitem__(self, idx):
+                features, target = self.positions[idx]
+                return features, torch.tensor([target], dtype=torch.float32)
+                
+        # Create dataset
+        return ChessPositionDataset(processed_positions)
     
     def save_to_csv(self, filename=None):
         """
@@ -166,13 +415,13 @@ class RealtimeFinetuner:
     """
     Class for fine-tuning the NNUE model in real-time based on move quality feedback.
     """
-    def __init__(self, model=None, learning_rate=0.0001, weights_path=None):
+    def __init__(self, model=None, learning_rate=0.00002, weights_path=None):
         """
         Initialize a real-time fine-tuner.
         
         Args:
             model: NNUE model to fine-tune (None to load or create new)
-            learning_rate: Learning rate for fine-tuning
+            learning_rate: Learning rate for fine-tuning (very low for better retention)
             weights_path: Path to initial weights file (None for default)
         """
         # Initialize model
@@ -258,10 +507,11 @@ class RealtimeFinetuner:
         
         if quality_value < 0:
             # Bad move - adjust in opposite direction
-            target_eval = -current_eval * (abs(quality_value) / 3.0)  # Scale by severity
+            # More aggressive negative adjustment: flip the sign and scale by severity
+            target_eval = -current_eval * (abs(quality_value) / 2.0)  # Stronger negative adjustment
         else:
             # Good move - reinforce evaluation
-            target_eval = current_eval * (1.0 + quality_value / 3.0)  # Boost by quality
+            target_eval = current_eval * (1.0 + quality_value / 2.0)  # Stronger positive reinforcement
         
         # Clamp target to reasonable range
         target_eval = torch.clamp(target_eval, -600, 600)
@@ -326,7 +576,8 @@ class RealtimeFinetuner:
         Returns:
             Path to the saved weights file
         """
-        return save_weights(self.model, name)
+        from src.engine.nnue.model_handler import save_model
+        return save_model(self.model, name)
     
     def reset_to_default(self):
         """
@@ -353,13 +604,13 @@ class FineTuner:
     """
     Class for fine-tuning the NNUE model based on self-play data.
     """
-    def __init__(self, model=None, learning_rate=0.0001):
+    def __init__(self, model=None, learning_rate=0.00002):
         """
         Initialize a fine-tuner.
         
         Args:
             model: NNUE model to fine-tune (None to load latest)
-            learning_rate: Learning rate for fine-tuning
+            learning_rate: Learning rate for fine-tuning (very low for better retention)
         """
         # Load model if none provided
         if model is None:
@@ -379,13 +630,13 @@ class FineTuner:
         # Create trainer with lower learning rate for fine-tuning
         self.trainer = NNUETrainer(model=self.model, learning_rate=learning_rate)
     
-    def finetune(self, data, epochs=10, batch_size=64, validation_split=0.1):
+    def finetune(self, data, epochs=50, batch_size=64, validation_split=0.1):
         """
         Fine-tune the model on self-play data.
         
         Args:
             data: SelfPlayData object
-            epochs: Number of epochs to train
+            epochs: Number of epochs to train (default: 50)
             batch_size: Batch size for training
             validation_split: Fraction of data to use for validation
             
@@ -424,14 +675,14 @@ class FineTuner:
         
         return self.model, history
 
-def auto_finetune(engine, games=10, epochs=5, positions_per_game=30):
+def auto_finetune(engine, games=10, epochs=50, positions_per_game=30):
     """
     Automatically finetune NNUE model by playing games against itself.
     
     Args:
         engine: NNUEEngine instance
         games: Number of self-play games
-        epochs: Number of fine-tuning epochs
+        epochs: Number of fine-tuning epochs (default: 50)
         positions_per_game: Maximum positions to save per game
         
     Returns:
@@ -488,6 +739,181 @@ def auto_finetune(engine, games=10, epochs=5, positions_per_game=30):
     
     return model
 
+def finetune_from_pgn(pgn_file, epochs=50, batch_size=1, feedback=None, use_memory=True):
+    """
+    Finetune the NNUE model from a PGN file.
+    
+    Args:
+        pgn_file: Path to the PGN file
+        epochs: Number of training epochs (default: 50)
+        batch_size: Batch size for training
+        feedback: Optional dictionary with game outcome feedback. Examples:
+                 - For win: {"result": "win", "emphasis": 1.5}
+                 - For loss with inverse learning: {"result": "loss", "inverse_learning": True, "emphasis": 2.0}
+                 - For selective learning: {"learn_from_winner": True, "engine_color": "white"}
+        use_memory: Whether to use the position memory for additional training data
+        
+    Returns:
+        Fine-tuned model
+    """
+    print(f"Loading model and PGN file: {pgn_file}")
+    
+    # Try to load model from default location
+    model_path = "saved_models/default_weights.pt"
+    if os.path.exists(model_path):
+        try:
+            model = load_model(model_path)
+            print(f"Loaded model from {model_path}")
+        except Exception as e:
+            print(f"Error loading model: {e}, creating new model")
+            model = create_model()
+    else:
+        print(f"No model found, creating new model")
+        model = create_model()
+    
+    # Create trainer with much lower learning rate for better knowledge retention
+    trainer = NNUETrainer(model=model, learning_rate=0.00002)
+    
+    # Load dataset from PGN with optional feedback
+    dataset = trainer.load_dataset_from_pgn(pgn_file, feedback=feedback)
+    
+    if dataset is None or len(dataset) == 0:
+        print("No valid positions found in PGN file")
+        return model
+    
+    print(f"Loaded {len(dataset)} positions from PGN file")
+    
+    # Implement curriculum learning - gradually train with increasing data complexity
+    print("\n📚 Implementing curriculum learning strategy:")
+    
+    # Phase 1: Train on just the current game
+    print("\n📝 Phase 1: Learning from current game only")
+    history1 = trainer.train(dataset, batch_size=batch_size, epochs=int(epochs * 0.4))
+    
+    # Phase 2: Add similar positions from memory
+    if use_memory and len(POSITION_MEMORY.positions) > 0:
+        print("\n🧠 Phase 2: Adding knowledge from memory (similar positions)")
+        # Create a dataset that includes memory positions
+        from src.engine.finetune import SelfPlayData
+        memory_data = SelfPlayData(use_memory=True)
+        
+        # For each position in the current dataset, extract features directly
+        current_features = []
+        for i in range(len(dataset)):
+            features, eval_score = dataset[i]
+            # Store the features directly
+            current_features.append((features, eval_score))
+        
+        # Add current features to memory_data
+        memory_data.positions = current_features
+        
+        # Create an augmented dataset with memory
+        memory_dataset = memory_data.create_dataset(include_memory=True, memory_ratio=0.3)
+        
+        # Train on the combined dataset with slightly lower learning rate
+        trainer.optimizer = torch.optim.Adam(model.parameters(), lr=0.00001)
+        history2 = trainer.train(memory_dataset, batch_size=batch_size, epochs=int(epochs * 0.6))
+        
+        # Combine training histories
+        history = {
+            'train_loss': history1['train_loss'] + history2['train_loss'],
+            'val_loss': history1.get('val_loss', []) + history2.get('val_loss', [])
+        }
+    else:
+        # Just continue training on the same dataset
+        history = history1
+    
+    print("\n✨ Curriculum learning complete!")
+    
+    # Save the model to default_weights.pt
+    weights_path = save_model(model, "default_weights")
+    
+    # Also save with descriptive name for record keeping
+    pgn_basename = os.path.basename(pgn_file).replace('.pgn', '')
+    result_tag = ""
+    if feedback and feedback.get('result'):
+        result_tag = f"_{feedback['result']}"
+        
+    # Create a timestamp-based filename
+    backup_path = save_model(model, f"from_{pgn_basename}{result_tag}")
+    
+    print(f"Fine-tuned model saved to {weights_path}")
+    print(f"Final training loss: {history['train_loss'][-1]:.6f}")
+    
+    return model
+
+def finetune_from_recent_pgns(pgn_dir="pgns", num_files=5, epochs=50, batch_size=32, feedback=None):
+    """
+    Finetune the NNUE model using recent PGN files in the given directory.
+    
+    Args:
+        pgn_dir: Directory containing PGN files
+        num_files: Number of most recent files to use
+        epochs: Number of training epochs (default: 50)
+        batch_size: Batch size for training
+        feedback: Optional dictionary with game outcome feedback
+        
+    Returns:
+        Fine-tuned model
+    """
+    import os
+    import glob
+    
+    # Get list of PGN files in the directory
+    pgn_files = glob.glob(os.path.join(pgn_dir, "*.pgn"))
+    
+    if not pgn_files:
+        print(f"No PGN files found in {pgn_dir}")
+        return None
+    
+    # Sort by modification time (newest first)
+    pgn_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+    
+    # Take only the specified number of files
+    pgn_files = pgn_files[:num_files]
+    
+    if not pgn_files:
+        print("No PGN files selected for finetuning")
+        return None
+    
+    print(f"Finetuning from {len(pgn_files)} recent PGN files:")
+    for idx, pgn_file in enumerate(pgn_files):
+        print(f"{idx+1}. {os.path.basename(pgn_file)}")
+    
+    # Try to load model or create a new one
+    model_path = "saved_models/default_weights.pt"
+    if os.path.exists(model_path):
+        try:
+            model = load_model(model_path)
+            print(f"Loaded model from {model_path}")
+        except Exception as e:
+            print(f"Error loading model: {e}, creating new model")
+            model = create_model()
+    else:
+        print(f"No model found, creating new model")
+        model = create_model()
+    
+    # Finetune on each PGN file
+    for pgn_file in pgn_files:
+        print(f"\nFinetuning on {os.path.basename(pgn_file)}...")
+        model = finetune_from_pgn(
+            pgn_file, 
+            epochs=epochs, 
+            batch_size=batch_size, 
+            feedback=feedback
+        )
+    
+    # Save final model as default weights
+    weights_path = save_model(model, "default_weights")
+    
+    # Backup with timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = save_model(model, f"finetuned_multi_{timestamp}")
+    
+    print(f"Final fine-tuned model saved to {weights_path}")
+    
+    return model
+
 def initialize_default_weights():
     """
     Initialize default weights file if it doesn't exist.
@@ -495,17 +921,18 @@ def initialize_default_weights():
     Returns:
         Path to default weights file
     """
+    # Create default_weights.pt if it doesn't exist
     default_weights_path = os.path.join("saved_models", "default_weights.pt")
-    
     if not os.path.exists(default_weights_path):
-        # Create directory if it doesn't exist
+        # Create directory if needed
         os.makedirs("saved_models", exist_ok=True)
         
         # Create a new model
-        model = NNUE()
+        model = create_model()
         
-        # Save as default weights
+        # Save state dict directly for maximum compatibility
         torch.save(model.state_dict(), default_weights_path)
         print(f"Created default weights at {default_weights_path}")
     
+    # Return default weights path
     return default_weights_path

@@ -258,16 +258,21 @@ def display_board(board, perspective=chess.WHITE):
     
     return "\n".join(board_str)
 
-def centipawn_to_win_probability(cp_score):
+def centipawn_to_win_probability(cp_score, perspective=chess.WHITE):
     """
     Convert centipawn score to winning probability.
     
     Args:
         cp_score: Centipawn score
+        perspective: Which side's perspective the probability is for (WHITE/BLACK)
         
     Returns:
         Win probability (0 to 1)
     """
+    # Normalize score to the requested perspective
+    if perspective == chess.BLACK:
+        cp_score = -cp_score
+        
     # Based on logistic function, commonly used in Elo calculations
     return 1.0 / (1.0 + 10.0 ** (-cp_score / 400.0))
 

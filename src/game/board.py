@@ -67,39 +67,61 @@ class ChessBoard:
         Returns:
             True if move was made, False if illegal
         """
-        # Convert string move to Move object if needed
-        if isinstance(move, str):
-            try:
-                move = chess.Move.from_uci(move)
-            except ValueError:
-                # Try SAN format
+        try:
+            # Convert string move to Move object if needed
+            if isinstance(move, str):
                 try:
-                    move = self.board.parse_san(move)
+                    move = chess.Move.from_uci(move)
                 except ValueError:
-                    return False
-        
-        # Check if move is legal
-        if move not in self.board.legal_moves:
+                    # Try SAN format
+                    try:
+                        move = self.board.parse_san(move)
+                    except ValueError:
+                        print(f"Invalid move format: {move}")
+                        return False
+            
+            # Check if move is legal
+            if move not in self.board.legal_moves:
+                print(f"Illegal move: {move.uci()} not in {[m.uci() for m in list(self.board.legal_moves)[:5]]}...")
+                return False
+            
+            # Double-check: validate move properties
+            from_square = move.from_square
+            to_square = move.to_square
+            
+            # Verify the from square has a piece
+            piece = self.board.piece_at(from_square)
+            if not piece:
+                print(f"Invalid move: No piece at {chess.square_name(from_square)}")
+                return False
+                
+            # Verify the piece's color matches the turn
+            if piece.color != self.board.turn:
+                print(f"Invalid move: {piece.symbol()} at {chess.square_name(from_square)} belongs to the wrong side")
+                return False
+            
+            # Check for capture
+            self.last_capture = self.board.is_capture(move)
+            
+            # Make the move
+            self.board.push(move)
+            self.last_move = move
+            
+            # Update history
+            self.move_history.append(move)
+            self.position_history.append(self.board.fen())
+            
+            # Check if game is over
+            if self.board.is_checkmate():
+                self.game_result = "1-0" if self.board.turn == chess.BLACK else "0-1"
+            elif self.board.is_stalemate() or self.board.is_insufficient_material():
+                self.game_result = "1/2-1/2"
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error making move {move if isinstance(move, str) else move.uci() if hasattr(move, 'uci') else str(move)}: {e}")
             return False
-        
-        # Check for capture
-        self.last_capture = self.board.is_capture(move)
-        
-        # Make the move
-        self.board.push(move)
-        self.last_move = move
-        
-        # Update history
-        self.move_history.append(move)
-        self.position_history.append(self.board.fen())
-        
-        # Check if game is over
-        if self.board.is_checkmate():
-            self.game_result = "1-0" if self.board.turn == chess.BLACK else "0-1"
-        elif self.board.is_stalemate() or self.board.is_insufficient_material():
-            self.game_result = "1/2-1/2"
-        
-        return True
     
     def undo_move(self):
         """
@@ -266,10 +288,31 @@ class ChessBoard:
         
         for move in self.move_history:
             if use_san:
-                moves.append(board.san(move))
+                try:
+                    # Check if move is legal before using san()
+                    if move in board.legal_moves:
+                        moves.append(board.san(move))
+                    else:
+                        # For illegal moves, fall back to UCI notation with a marker
+                        moves.append(f"{move.uci()}?")
+                except Exception as e:
+                    # If anything goes wrong, use UCI notation with a marker
+                    moves.append(f"{move.uci()}?")
             else:
+                # Always safe to use UCI
                 moves.append(move.uci())
-            board.push(move)
+                
+            try:
+                # Make the move (even if it was illegal, to maintain board state)
+                board.push(move)
+            except Exception as e:
+                # If we can't push the move, recreate the board from current position
+                print(f"Warning: Error in move history generation - {e}")
+                try:
+                    board = chess.Board(self.get_fen())
+                except:
+                    # If all else fails, restart from initial position
+                    board = chess.Board()
         
         return moves
     
@@ -321,11 +364,30 @@ class ChessBoard:
                     pgn += f"{fullmove_number}. "
                     fullmove_number += 1
                 
-                # Add move in algebraic notation
-                pgn += board.san(move) + " "
+                try:
+                    # Check if move is legal before using san()
+                    if move in board.legal_moves:
+                        # Add move in algebraic notation
+                        pgn += board.san(move) + " "
+                    else:
+                        # For illegal moves, fall back to UCI notation
+                        pgn += move.uci() + "? "
+                except Exception as e:
+                    # If anything goes wrong, use UCI notation with a marker
+                    pgn += move.uci() + "? "
                 
-                # Make the move
-                board.push(move)
+                try:
+                    # Make the move (even if it was illegal, to maintain board state)
+                    board.push(move)
+                except Exception as e:
+                    # If we can't push the move, create a new board from current position
+                    # This is a last resort to avoid breaking the entire PGN generation
+                    print(f"Warning: Error in PGN generation - {e}")
+                    try:
+                        board = chess.Board(self.get_fen())
+                    except:
+                        # If all else fails, restart from initial position
+                        board = chess.Board()
                 
                 # Add newline every 5 full moves
                 if i % 10 == 9:

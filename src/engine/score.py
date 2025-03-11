@@ -1,12 +1,20 @@
+"""
+Chess position evaluation module.
+
+This module provides functions for evaluating chess positions using:
+1. Neural Network for Chess Position Evaluation (NNUE)
+2. Classical evaluation (as fallback)
+"""
+
 import chess
 import torch
-import numpy as np
 import os
+import numpy as np
 
+# Import from our neural network implementation
 from src.engine.nnue.network import NNUE, board_to_features, get_feature_diff
-from src.engine.nnue.weights import load_weights, get_latest_weights
 
-# Global NNUE model instance
+# Global model instance
 nnue_model = None
 # Accumulator for efficient updates
 current_accumulator = None
@@ -97,25 +105,93 @@ piece_values = {
     chess.KING: 20000
 }
 
-def initialize_nnue():
+def create_model():
+    """
+    Create a new NNUE model.
+    
+    Returns:
+        New NNUE model
+    """
+    return NNUE()
+
+def save_model(model, filename="default_weights.pt"):
+    """
+    Save model weights to a file.
+    
+    Args:
+        model: NNUE model to save
+        filename: Target filename
+        
+    Returns:
+        Path to saved file
+    """
+    # Create directory if it doesn't exist
+    os.makedirs("saved_models", exist_ok=True)
+    
+    # Full path to save
+    path = os.path.join("saved_models", filename)
+    
+    # Save the model
+    torch.save(model.state_dict(), path)
+    print(f"Model weights saved to {path}")
+    
+    return path
+
+def load_model(model_path="saved_models/default_weights.pt"):
+    """
+    Load model weights from a file.
+    
+    Args:
+        model_path: Path to weights file
+        
+    Returns:
+        NNUE model with loaded weights
+    """
+    # Create new model
+    model = create_model()
+    
+    # Check if model weights exist
+    if os.path.exists(model_path):
+        try:
+            # Load weights
+            model.load_state_dict(torch.load(model_path))
+            print(f"Loaded model from {model_path}")
+        except Exception as e:
+            print(f"Error loading weights: {e}")
+            print("Creating new model instead")
+            model = create_model()
+    else:
+        print(f"Model weights not found: {model_path}")
+        print("Creating new model instead")
+        
+        # Save the new model for future use
+        default_path = os.path.join("saved_models", "default_weights.pt")
+        save_model(model, "default_weights.pt")
+        print(f"Created default weights at {default_path}")
+    
+    return model
+
+def initialize_nnue(model_path=None):
     """
     Initialize the NNUE model with saved weights or a new model.
+    
+    Args:
+        model_path: Path to model weights file (None for default)
+        
+    Returns:
+        Initialized NNUE model
     """
     global nnue_model, current_accumulator
     
-    # Create a new NNUE model
-    nnue_model = NNUE()
+    # Default model path if not specified
+    if model_path is None:
+        model_path = os.path.join("saved_models", "default_weights.pt")
     
-    # Check for saved weights
-    weights_path = get_latest_weights()
-    if weights_path:
-        try:
-            nnue_model = load_weights(nnue_model, weights_path)
-            print(f"Loaded NNUE weights from {weights_path}")
-        except Exception as e:
-            print(f"Error loading weights: {e}")
-    else:
-        print("No saved weights found, using initialized model")
+    # Load model
+    nnue_model = load_model(model_path)
+    
+    # Reset accumulator
+    current_accumulator = None
     
     # Set model to evaluation mode
     nnue_model.eval()
@@ -144,29 +220,39 @@ def evaluate_position(board):
         if last_board_fen and current_accumulator is not None:
             # Check if we can do an incremental update
             last_board = chess.Board(last_board_fen)
+            
             # Get the last move
             moves = list(board.move_stack)
             if len(moves) > len(last_board.move_stack) and len(last_board.move_stack) > 0:
                 last_move = moves[-1]
                 
                 # Calculate feature differences
-                add_features, remove_features = get_feature_diff(last_board, last_move)
+                add_features = get_feature_diff(last_board, last_move)
                 
                 # Update incrementally
                 with torch.no_grad():
                     score, current_accumulator = nnue_model.incremental_forward(
-                        current_accumulator, add_features, remove_features
+                        current_accumulator, 
+                        add_features, 
+                        None,
+                        board=board,
+                        move=None
                     )
             else:
                 # Full evaluation if incremental is not possible
                 features = board_to_features(board)
+                
                 with torch.no_grad():
-                    # Get the transformed features to use as new accumulator
-                    transformed = nnue_model.feature_transformer(features)
-                    current_accumulator = transformed
-                    
                     # Full forward pass
                     score = nnue_model(features)
+                    
+                    # Update accumulator for next incremental update
+                    _, current_accumulator = nnue_model.incremental_forward(
+                        None, 
+                        None, 
+                        None, 
+                        board=board
+                    )
             
             # Store current board FEN for future incremental updates
             last_board_fen = board.fen()
@@ -178,13 +264,18 @@ def evaluate_position(board):
         else:
             # First evaluation, do a full forward pass
             features = board_to_features(board)
+            
             with torch.no_grad():
-                # Get the transformed features to use as accumulator for future incremental updates
-                transformed = nnue_model.feature_transformer(features)
-                current_accumulator = transformed
-                
                 # Full forward pass
                 score = nnue_model(features)
+                
+                # Initialize accumulator for future incremental updates
+                _, current_accumulator = nnue_model.incremental_forward(
+                    None, 
+                    None, 
+                    None, 
+                    board=board
+                )
             
             # Store current board FEN for future incremental updates
             last_board_fen = board.fen()
@@ -235,6 +326,16 @@ def classical_evaluate(board):
         get_non_pawn_material(board, chess.BLACK) <= 1300
     )
     
+    # Early game flag (for king movement penalties)
+    move_count = len(board.move_stack)
+    is_early_game = move_count < 20
+    
+    # Development score - bonus for developed pieces and center control
+    development_score = 0
+    
+    # King movement penalty score
+    king_movement_score = 0
+    
     # Calculate material and piece-square scores
     for square in chess.SQUARES:
         piece = board.piece_at(square)
@@ -264,8 +365,73 @@ def classical_evaluate(board):
                 pst_score += pst[piece_symbol][7 - rank_idx][file_idx]
             else:
                 pst_score -= pst[piece_symbol][rank_idx][file_idx]
+        
+        # Development bonuses for early game
+        if is_early_game:
+            # Center control bonus (pieces on or controlling center)
+            center_squares = [chess.E4, chess.D4, chess.E5, chess.D5]
+            extended_center = [
+                chess.C3, chess.D3, chess.E3, chess.F3,
+                chess.C4, chess.F4, chess.C5, chess.F5,
+                chess.C6, chess.D6, chess.E6, chess.F6
+            ]
+            
+            # Knights and bishops developed (not on home rank)
+            if piece.piece_type in [chess.KNIGHT, chess.BISHOP]:
+                home_rank = 0 if piece.color == chess.WHITE else 7
+                if rank_idx != home_rank:
+                    # Bonus for developed minor piece
+                    dev_bonus = 25
+                    if piece.color == chess.WHITE:
+                        development_score += dev_bonus
+                    else:
+                        development_score -= dev_bonus
+            
+            # Bonus for controlling center squares
+            if piece.piece_type != chess.KING:  # King doesn't get center bonus
+                if square in center_squares:
+                    center_bonus = 30
+                    if piece.color == chess.WHITE:
+                        development_score += center_bonus
+                    else:
+                        development_score -= center_bonus
+                elif square in extended_center:
+                    center_bonus = 15
+                    if piece.color == chess.WHITE:
+                        development_score += center_bonus
+                    else:
+                        development_score -= center_bonus
     
-    # King safety (simple version)
+    # King movement penalties in early game
+    starting_king_squares = {
+        chess.WHITE: chess.E1,
+        chess.BLACK: chess.E8
+    }
+    
+    # Check if kings have moved (except for castling)
+    if is_early_game:
+        for color in [chess.WHITE, chess.BLACK]:
+            king_square = board.king(color)
+            castled = False
+            
+            # Detect castling
+            if color == chess.WHITE:
+                if king_square in [chess.G1, chess.C1]:
+                    castled = True
+            else:
+                if king_square in [chess.G8, chess.C8]:
+                    castled = True
+            
+            # Apply penalty if king moved but didn't castle
+            if king_square != starting_king_squares[color] and not castled:
+                # Severe penalty for early king movement (except castling)
+                early_king_move_penalty = 100
+                if color == chess.WHITE:
+                    king_movement_score -= early_king_move_penalty
+                else:
+                    king_movement_score += early_king_move_penalty
+    
+    # King safety (enhanced version)
     king_safety_score = 0
     for color in [chess.WHITE, chess.BLACK]:
         # Penalty for exposed king in middle game
@@ -277,7 +443,7 @@ def classical_evaluate(board):
                 # Penalize central king in middlegame
                 central_penalty = 0
                 if 2 < file_idx < 5:
-                    central_penalty = 20
+                    central_penalty = 40  # Increased from 20
                 
                 if color == chess.WHITE:
                     king_safety_score -= central_penalty
@@ -309,7 +475,9 @@ def classical_evaluate(board):
         pst_score +
         mobility_score +
         king_safety_score +
-        pawn_structure_score
+        pawn_structure_score +
+        development_score +
+        king_movement_score
     )
     
     # Return score from perspective of current player

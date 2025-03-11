@@ -1,13 +1,12 @@
 import chess
 import time
 import random
+import os
 from datetime import datetime
 
 from src.engine.search import get_best_move, iterative_deepening_search, SearchInfo
-from src.engine.score import evaluate_position, initialize_nnue
-from src.engine.nnue.network import NNUE
-from src.engine.nnue.weights import save_weights, load_weights, get_latest_weights
-from src.engine.finetune import RealtimeFinetuner, initialize_default_weights
+from src.engine.score import evaluate_position, initialize_nnue, save_model, load_model, create_model
+from src.engine.finetune import RealtimeFinetuner
 from src.engine.utils import evaluate_move_quality
 from src.engine.validator import validate_move, debug_board_state, validate_board_state
 
@@ -16,7 +15,7 @@ class NNUEEngine:
     Main chess engine class that integrates NNUE evaluation with
     alpha-beta search to find the best moves.
     """
-    def __init__(self, name="Pearl NNUE", depth=5, time_limit_ms=1000, enable_learning=True):
+    def __init__(self, name="Pearl NNUE", depth=7, time_limit_ms=3000, enable_learning=True, model_type=None):
         """
         Initialize a new chess engine.
         
@@ -25,14 +24,12 @@ class NNUEEngine:
             depth: Default search depth
             time_limit_ms: Default time limit in milliseconds
             enable_learning: Whether to enable real-time learning
+            model_type: Not used (kept for backward compatibility)
         """
         self.name = name
         self.depth = depth
         self.time_limit_ms = time_limit_ms
         self.enable_learning = enable_learning
-        
-        # Initialize default weights if they don't exist
-        initialize_default_weights()
         
         # Initialize NNUE model
         self.model = initialize_nnue()
@@ -63,9 +60,42 @@ class NNUEEngine:
         self.prev_eval = None
         self.move_quality_history = []
         
-        # Reset to default weights if learning is enabled
-        if self.enable_learning and self.finetuner:
-            self.finetuner.reset_to_default()
+        # Keep track of game statistics
+        if not hasattr(self, 'game_stats'):
+            self.game_stats = {
+                'games_played': 0,
+                'wins': 0,
+                'losses': 0,
+                'draws': 0,
+                'win_rate': 0.0
+            }
+        
+        # Try to load the default model
+        model_path = "saved_models/default_weights.pt"
+        if os.path.exists(model_path):
+            try:
+                self.model = load_model(model_path)
+                print(f"Loaded model from {model_path}")
+                
+                # Also update finetuner model if available
+                if self.enable_learning and self.finetuner:
+                    self.finetuner.model = self.model
+            except Exception as e:
+                print(f"\033[1;31mError loading model: {e}\033[0m")
+                
+                # Create a new model if loading fails
+                self.model = create_model(self.model_type)
+                
+                # Update finetuner with the new model
+                if self.enable_learning and self.finetuner:
+                    self.finetuner.model = self.model
+        else:
+            # Create a new model if no matching model found
+            self.model = create_model(self.model_type)
+            
+            # Update finetuner with the new model
+            if self.enable_learning and self.finetuner:
+                self.finetuner.model = self.model
         
     def set_position(self, fen=None):
         """
@@ -150,18 +180,24 @@ class NNUEEngine:
     
     def get_best_move(self, time_limit_ms=None, depth=None):
         """
-        Get the best move for the current position.
+        Get the best move for the current position using parallel search.
         
         Args:
-            time_limit_ms: Time limit in milliseconds (None for default)
+            time_limit_ms: Time limit in milliseconds (None for default of 60000 = 1 minute)
             depth: Search depth (None for default)
             
         Returns:
             Best move found
         """
-        # Use provided values or defaults
-        time_limit = time_limit_ms if time_limit_ms is not None else self.time_limit_ms
+        print(f"\033[1;36m🔍 Starting move search (max time: {time_limit_ms or 60000}ms)\033[0m")
+        
+        # Always use a safe time limit with a hard cap
+        time_limit = 30000 if time_limit_ms is None else min(time_limit_ms, 30000)  # Cap at 30 seconds
         search_depth = depth if depth is not None else self.depth
+        
+        # Count legal moves for debugging
+        legal_move_count = len(list(self.board.legal_moves))
+        print(f"\033[1;33m🧠 Analyzing position with {legal_move_count} legal moves\033[0m")
         
         # Initialize search info
         info = SearchInfo()
@@ -170,8 +206,18 @@ class NNUEEngine:
         # Record start time
         start_time = time.time()
         
-        # Perform search
-        best_move, score, reached_depth = iterative_deepening_search(self.board, info)
+        try:
+            # Perform search with safety checks
+            print("\033[1;36m⏱️ Starting iterative deepening search...\033[0m")
+            best_move, score, reached_depth = iterative_deepening_search(self.board, info)
+            print(f"\033[1;32m✓ Search completed at depth {reached_depth}\033[0m")
+        except Exception as e:
+            # If search fails, log error and pick a random move
+            print(f"\033[1;31m❌ Search error: {e}\033[0m")
+            legal_moves = list(self.board.legal_moves)
+            best_move = random.choice(legal_moves) if legal_moves else None
+            score = 0
+            reached_depth = 0
         
         # Record end time and nodes
         end_time = time.time()
@@ -181,19 +227,20 @@ class NNUEEngine:
         
         # Print search statistics
         nps = int(info.nodes_searched * 1000 / max(elapsed_ms, 1))
-        print(f"bestmove {best_move} score cp {score} depth {reached_depth} nodes {info.nodes_searched} time {elapsed_ms} nps {nps}")
+        print(f"\033[1;32mbestmove {best_move} score cp {score} depth {reached_depth} nodes {info.nodes_searched} time {elapsed_ms}ms nps {nps}\033[0m")
         
         # Validate that the move is legal in the current position
         if best_move and best_move not in self.board.legal_moves:
-            print(f"Warning: Engine suggested illegal move {best_move}. Recalculating...")
+            print(f"\033[1;31m⚠️ Warning: Engine suggested illegal move {best_move}. Using fallback...\033[0m")
             # Get a list of legal moves
             legal_moves = list(self.board.legal_moves)
             if legal_moves:
                 # Choose a random legal move as fallback
                 best_move = random.choice(legal_moves)
-                print(f"Selected alternative move: {best_move}")
+                print(f"\033[1;33m↪️ Selected alternative move: {best_move}\033[0m")
             else:
                 best_move = None
+                print("\033[1;31m❌ No legal moves available!\033[0m")
         
         return best_move
     
@@ -304,7 +351,7 @@ class NNUEEngine:
     
     def save_model(self, name=None):
         """
-        Save the current NNUE model weights.
+        Save the current neural network model weights.
         
         Args:
             name: Optional name for the weights file
@@ -313,29 +360,44 @@ class NNUEEngine:
             Path to the saved weights file
         """
         if self.enable_learning and self.finetuner:
-            return self.finetuner.save_model(name)
-        else:
-            return save_weights(self.model, name)
+            # Save through finetuner, which might apply additional logic
+            if hasattr(self.finetuner, 'save_model'):
+                return self.finetuner.save_model(name)
+            
+        # Use our new save_model function
+        return save_model(self.model, name)
     
-    def load_model(self, path=None):
+    def load_model(self, path=None, model_type=None):
         """
-        Load NNUE model weights.
+        Load neural network model weights.
         
         Args:
             path: Path to weights file (None for latest)
+            model_type: Type of model to load (None for current type)
             
         Returns:
             True if successful, False otherwise
         """
         try:
+            # Use current model type if none specified
+            if model_type is None:
+                model_type = self.model_type
+                
+            # If path not specified, find the best match
             if path is None:
-                path = get_latest_weights()
+                path = find_best_matching_model(model_type)
                 if path is None:
-                    print("No weights found")
+                    print(f"No {model_type} model found")
                     return False
             
-            # Load weights into model
-            self.model = load_weights(self.model, path)
+            # Store the path for reference
+            self.current_weights_path = path
+            
+            # Update model type
+            self.model_type = model_type
+            
+            # Load model using our new load_model function
+            self.model = load_model(path, model_type)
             
             # Update fine-tuner model if available
             if self.enable_learning and self.finetuner:
@@ -343,8 +405,17 @@ class NNUEEngine:
             
             return True
         except Exception as e:
-            print(f"Error loading weights: {e}")
+            print(f"Error loading model: {e}")
             return False
+            
+    def get_current_weights_path(self):
+        """
+        Get the path of the currently loaded weights file.
+        
+        Returns:
+            Path to the current weights file, or 'Unknown' if not recorded
+        """
+        return getattr(self, 'current_weights_path', 'Unknown')
     
     def toggle_learning(self, enable=None):
         """
