@@ -232,110 +232,101 @@ python main.py --model ../saved_models/final_model.pt
 
 # Pearl Chess Engine
 
-Pearl is a chess engine and AI training framework designed to learn from master games and improve through self-play.
+A high-performance classical chess engine with multiple interface options.
 
-## Engine Improvements
+## Features
 
-The Pearl chess engine has been enhanced with several classical chess engine techniques:
-
-### 1. Attack Maps
-- Added support for attack maps to improve tactical awareness
-- Implemented functions to generate and evaluate attack patterns
-- Enhanced position evaluation by considering piece attacks and threats
-
-### 2. Move Pruning
-- Implemented futility pruning to skip moves unlikely to improve the position
-- Added late move reduction (LMR) to search promising moves more deeply
-- Enhanced move ordering with MVV-LVA (Most Valuable Victim - Least Valuable Aggressor)
-
-### 3. Value Maps
-- Added piece-square tables for different game phases
-- Implemented position-dependent piece evaluation
-- Enhanced evaluation by considering piece placement and coordination
-
-### 4. Iterative Deepening
-- Upgraded iterative deepening to allow for up to 3 minutes of thinking time
-- Implemented time management to ensure efficient use of allocated time
-- Added principal variation search for more efficient tree exploration
-
-### 5. Transposition Tables
-- Added support for efficient transposition tables with aging mechanism
-- Implemented memory-efficient storage with LRU replacement strategy
-- Enhanced search speed by reusing previously evaluated positions
+- Strong classical chess engine with optimized evaluation functions
+- Multiple user interface options, including:
+  - **NEW: Graphical user interface with drag-and-drop** (default mode)
+  - Text-based terminal interface (interactive mode)
+  - Mouse-controlled terminal interface for TUI with mouse selection
+  - UCI protocol support for integration with other chess GUIs
+- Position analysis and evaluation
+- Configurable search depth and time limits
 
 ## Installation
 
-1. Clone the repository:
-```bash
-git clone https://github.com/yourusername/pearl.git
-cd pearl
+1. Clone this repository
+2. Install dependencies:
 ```
-
-2. Install the required dependencies:
-```bash
-pip install -r requirements.txt
+pip install python-chess prompt_toolkit
 ```
 
 ## Usage
 
-### Playing Against the Engine
+The engine supports multiple modes of operation:
 
-To play against the Pearl chess engine:
+### Graphical User Interface (Default)
 
-```bash
-python main.py --mode play
+The newest addition is a full graphical interface with drag-and-drop functionality:
+
+```
+python -m src.main --mode gui
 ```
 
-### Training the Model
+or simply:
 
-To train the model using the dataset of master games:
-
-```bash
-python main.py --mode train
+```
+python -m src.main
 ```
 
-### Converting PGN to CSV
+Features:
+- Drag-and-drop pieces to make moves
+- Visual highlighting of selected pieces and legal moves
+- Board flipping option to view from either side
+- Clear indication of captured pieces and check
+- Promotion dialog when pawns reach the 8th rank
+- "Engine Move" button to request the engine to play at any time
+- Status bar showing the current game state and evaluation
 
-To convert PGN files to the training dataset format:
+### Mouse-based Terminal Interface
 
-```bash
-python src/pgn_to_csv.py
+A terminal-based interface with mouse click support:
+
+```
+python -m src.main --mode mouse
 ```
 
-This will process all PGN files in the `dataset/mastergames` directory and append the data to `dataset/dataset.csv`.
+Features:
+- Click on a piece to select it - legal moves will be highlighted
+- Click on a destination square to move the piece
+- Engine automatically responds with its move
 
-### Engine Self-Play
+### Text-based Interactive Mode
 
-To have the engine play against itself to generate training data:
-
-```bash
-python main.py --mode selfplay --games 100
+```
+python -m src.main --mode interactive
 ```
 
-### Evaluating Positions
+Enter moves in UCI format (e.g., "e2e4") or SAN format (e.g., "e4").
+Additional commands:
+- `new` - Start a new game
+- `fen` - Show the current FEN position
+- `setboard [fen]` - Set a custom position
+- `go` - Request the engine to make a move
+- `quit` - Exit the program
 
-To evaluate a specific position:
+### Position Analysis
 
-```bash
-python main.py --mode eval --fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+```
+python -m src.main --mode position --fen "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" --depth 5 --verbose
 ```
 
-## Project Structure
+### UCI Mode (for Chess GUIs)
 
-- `src/engine/`: Core chess engine components
-  - `search.py`: Alpha-beta search with enhancements
-  - `score.py`: Position evaluation functions
-  - `movePick.py`: Move ordering for efficient search
-  - `memory.py`: Transposition table implementation
-- `src/modes/`: Different operation modes
-  - `etrain.py`: Training functionality
-  - `eplay.py`: Interactive play mode
-  - `eselfplay.py`: Self-play for data generation
-- `src/nnue/`: Neural network components
-- `dataset/`: Training data
-  - `mastergames/`: PGN files of master games
-  - `dataset.csv`: Processed training data
+```
+python -m src.main --mode uci
+```
+
+## Configuration Options
+
+- `--depth`, `-d`: Search depth (default: 4)
+- `--time`, `-t`: Time limit in milliseconds (default: 1000)
+- `--tt-size`: Transposition table size in MB (default: 64)
+- `--verbose`, `-v`: Show verbose output
+- `--fen`: FEN string for position evaluation
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+[MIT License](LICENSE)
